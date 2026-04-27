@@ -36,6 +36,27 @@
   cursor: help;
   box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
 }
+.mw-badge.mw-steal {
+  background: linear-gradient(135deg, #ffd700 0%, #ff8a00 100%);
+  color: #1a1a1a;
+  font-weight: 800;
+  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.5);
+  box-shadow: 0 0 0 2px rgba(255, 215, 0, 0.65), 0 4px 14px rgba(255, 138, 0, 0.55);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .mw-badge.mw-steal {
+    animation: mw-steal-pulse 2.2s ease-in-out infinite;
+  }
+}
+@keyframes mw-steal-pulse {
+  0%, 100% {
+    box-shadow: 0 0 0 2px rgba(255, 215, 0, 0.55), 0 4px 12px rgba(255, 138, 0, 0.45);
+  }
+  50% {
+    box-shadow: 0 0 0 5px rgba(255, 215, 0, 0.85), 0 6px 22px rgba(255, 138, 0, 0.75);
+  }
+}
+
 .mw-badge.mw-good {
   background: #2e7d32;
   color: white;
@@ -68,7 +89,8 @@
 #mw-clear,
 #mw-setloc,
 #mw-hideskips,
-#mw-hidefair {
+#mw-hidefair,
+#mw-hidegood {
   padding: 12px 22px;
   border: none;
   border-radius: 24px;
@@ -84,12 +106,14 @@
 }
 
 #mw-hideskips,
-#mw-hidefair {
+#mw-hidefair,
+#mw-hidegood {
   background: #6a4c93;
   color: white;
 }
 #mw-hideskips:hover,
-#mw-hidefair:hover {
+#mw-hidefair:hover,
+#mw-hidegood:hover {
   background: #503872;
 }
 
@@ -109,13 +133,24 @@
 #mw-hidefair.mw-active:hover {
   background: #c98a18;
 }
+#mw-hidegood.mw-active {
+  background: #2e7d32;
+  color: white;
+}
+#mw-hidegood.mw-active:hover {
+  background: #1f5723;
+}
 
-/* When body has either toggle class, the matching cards collapse out of
-   the grid via CSS :has(). */
+/* When body has any of the toggle classes, the matching cards collapse out
+   of the grid via CSS :has(). Steal is intentionally never hidable — the
+   whole tool exists to surface those. */
 body.mw-hide-skips [data-mw-card="1"]:has(.mw-badge.mw-skip) {
   display: none !important;
 }
 body.mw-hide-fair [data-mw-card="1"]:has(.mw-badge.mw-fair) {
+  display: none !important;
+}
+body.mw-hide-good [data-mw-card="1"]:has(.mw-badge.mw-good) {
   display: none !important;
 }
 

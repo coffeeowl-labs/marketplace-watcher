@@ -37,12 +37,15 @@ When trip-cost fields are present, compute effective_price = listed_price + roun
 - When trip cost is significant (round-trip > $15 OR distance > 15 mi), mention it in the reason, ideally with the dollar figure.
 
 For each listing, return one verdict:
-- "good": clearly worth pursuing — priced below typical market value AND the deal still pencils after trip cost
-- "fair": priced about right, or a decent deal eroded by distance
+- "steal": effective price is 30% or more below typical market value for the item in this condition, OR the listing is demonstrably outstanding in another way (rare/desirable model in great condition, accessories alone worth more than the asking price, etc.). If your own reason describes the deal with words like "steal", "incredible", "rare find", "well below market", "great deal at X% off", or names a specific dollar discount of 30%+, the verdict MUST be "steal" — not "good". Do not under-grade exceptional listings out of caution; "steal" is the whole reason this tool exists. These are listings worth contacting the seller about immediately.
+- "good": priced 10–30% below typical market value AND the deal still pencils after trip cost. A solid deal but not a blowout.
+- "fair": priced about right (within ~10% of market), or a decent deal eroded by distance
 - "skip": overpriced, suspicious (vague description, scam patterns), low quality for the price, or made unattractive by trip cost
 
+Evaluate each listing INDEPENDENTLY against typical market value. The other listings in this batch are not reference points — do not grade on a curve. If every listing in a batch is overpriced, none of them are "good" or "steal" by virtue of being least-bad. If every listing is underpriced, all of them can be "good" or "steal".
+
 Respond with ONLY a JSON array, no prose, no markdown fences. One object per input listing, in the same order, with the same id echoed back:
-[{"id": "<id>", "verdict": "good"|"fair"|"skip", "reason": "<one short sentence>"}]
+[{"id": "<id>", "verdict": "steal"|"good"|"fair"|"skip", "reason": "<one short sentence>"}]
 """
 
 

@@ -9,7 +9,8 @@ const selectedIds = new Set();
 let cachedVerdicts = {}; // id -> verdict object
 let mutationDebounceTimer = null;
 
-// Each entry: storage key -> {bodyClass, buttonId, onLabel, offLabel}
+// Each entry: storage key -> {bodyClass, buttonId, onLabel, offLabel}.
+// Order here is the order they appear in the bar.
 const HIDE_TOGGLES = {
   hide_skips: {
     bodyClass: "mw-hide-skips",
@@ -22,6 +23,12 @@ const HIDE_TOGGLES = {
     buttonId: "mw-hidefair",
     offLabel: "Hide Fair",
     onLabel: "Show Fair",
+  },
+  hide_good: {
+    bodyClass: "mw-hide-good",
+    buttonId: "mw-hidegood",
+    offLabel: "Hide Good",
+    onLabel: "Show Good",
   },
 };
 
