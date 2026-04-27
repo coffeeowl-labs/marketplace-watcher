@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "Marketplace Watcher",
+  "version": "0.1.0",
+  "description": "Evaluate selected Facebook Marketplace listings via a local Claude helper.",
+
+  "permissions": ["storage", "tabs"],
+  "host_permissions": [
+    "*://www.facebook.com/marketplace/*",
+    "http://127.0.0.1:8787/*",
+    "https://nominatim.openstreetmap.org/*",
+    "https://router.project-osrm.org/*"
+  ],
+
+  "background": {
+    "scripts": ["background.js"]
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["*://www.facebook.com/marketplace/*search*"],
+      "js": ["content/search.js"],
+      "css": ["content/overlay.css"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["*://www.facebook.com/marketplace/item/*"],
+      "js": ["content/listing.js"],
+      "run_at": "document_idle"
+    }
+  ],
+
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "marketplace-watcher@local",
+      "strict_min_version": "115.0"
+    }
+  }
+}

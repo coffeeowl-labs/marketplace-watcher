@@ -1,0 +1,315 @@
+// background.js — orchestrates scraping + evaluation
+//
+// Flow when search page sends {type:'evaluate', listingIds}:
+//   1. Look up cached verdicts; only fetch the uncached ones
+//   2. For each uncached id, open an inactive tab, wait for listing.js to
+//      send {type:'scraped'}, then close the tab. Sequential with delay so
+//      we don't open 20 tabs at once.
+//   3. POST scraped batch to local helper, get verdicts
+//   4. Persist new verdicts to storage and return full set to the search page
+
+const HELPER_URL = "http://127.0.0.1:8787/evaluate";
+const TAB_OPEN_DELAY_MS = 2000;
+const SCRAPE_TIMEOUT_MS = 20000;
+
+// Trip cost assumptions — refine in a later version with real per-vehicle data.
+const NOMINATIM_URL = "https://nominatim.openstreetmap.org/search";
+const NOMINATIM_MIN_INTERVAL_MS = 1100; // be polite to OSM's free service
+const OSRM_URL = "https://router.project-osrm.org/route/v1/driving";
+const OSRM_MIN_INTERVAL_MS = 1100;
+const HOURLY_TIME_COST = 20;
+const GAS_COST_PER_GALLON = 5;
+const AVG_MPG = 25;
+// OSRM gives free-flow (no-traffic) distance and duration. We deliberately
+// do NOT apply a traffic multiplier — the user picks when to drive.
+// Haversine fallback constants used only when OSRM is unreachable:
+const FALLBACK_AVG_SPEED_MPH = 40;
+const FALLBACK_ROAD_FACTOR = 1.3;
+
+const pendingScrapes = new Map(); // listingId -> {resolve, reject, timer, tabId}
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.type === "evaluate") {
+    handleEvaluate(msg.listingIds, sender.tab.id)
+      .then(sendResponse)
+      .catch((e) => sendResponse({ error: e.message }));
+    return true; // async response
+  }
+  if (msg.type === "scraped") {
+    const pending = pendingScrapes.get(msg.listingId);
+    if (pending) {
+      clearTimeout(pending.timer);
+      pendingScrapes.delete(msg.listingId);
+      pending.resolve(msg.data);
+    }
+    sendResponse({ ok: true });
+    return false;
+  }
+});
+
+async function handleEvaluate(listingIds, sourceTabId) {
+  const cacheKeys = listingIds.map((id) => `verdict:${id}`);
+  const cached = await chrome.storage.local.get(cacheKeys);
+  const uncachedIds = listingIds.filter((id) => !cached[`verdict:${id}`]);
+
+  sendProgress(sourceTabId, {
+    phase: "fetching",
+    total: uncachedIds.length,
+    done: 0,
+  });
+
+  console.log("[mw] evaluate request", { listingIds, cached: listingIds.length - uncachedIds.length, uncached: uncachedIds.length });
+
+  const userLoc = await getUserLocation();
+  if (userLoc) {
+    console.log(`[mw] user location: ${userLoc.display} (${userLoc.lat}, ${userLoc.lng})`);
+  } else {
+    console.log("[mw] no user location set or geocoding failed; trip costs disabled");
+  }
+
+  const scraped = [];
+  for (let i = 0; i < uncachedIds.length; i++) {
+    const id = uncachedIds[i];
+    console.log(`[mw] scraping ${i + 1}/${uncachedIds.length}: ${id}`);
+    try {
+      const data = await scrapeListing(id);
+      console.log(`[mw] scraped ${id}:`, {
+        title: data.title,
+        price: data.price,
+        location: data.location,
+        descChars: (data.description || "").length,
+        descPreview: (data.description || "").slice(0, 120),
+      });
+
+      const enriched = { id, ...data };
+      if (userLoc && data.location) {
+        const listingGeo = await geocode(data.location);
+        if (listingGeo) {
+          const trip = await computeTrip(userLoc, listingGeo);
+          Object.assign(enriched, trip);
+          console.log(`[mw] trip ${id}:`, trip);
+        } else {
+          console.log(`[mw] could not geocode listing location: ${data.location}`);
+        }
+      }
+      scraped.push(enriched);
+    } catch (e) {
+      console.warn(`[mw] scrape failed ${id}:`, e.message);
+      scraped.push({ id, error: e.message });
+    }
+    sendProgress(sourceTabId, {
+      phase: "fetching",
+      total: uncachedIds.length,
+      done: i + 1,
+    });
+    if (i < uncachedIds.length - 1) {
+      await sleep(TAB_OPEN_DELAY_MS);
+    }
+  }
+
+  const valid = scraped.filter((s) => !s.error);
+  let verdicts = [];
+  if (valid.length) {
+    sendProgress(sourceTabId, { phase: "evaluating" });
+    console.log("[mw] sending to helper:", valid.map(v => ({id: v.id, title: v.title, price: v.price})));
+    try {
+      const resp = await fetch(HELPER_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ listings: valid }),
+      });
+      if (!resp.ok) {
+        const text = await resp.text();
+        throw new Error(`helper ${resp.status}: ${text.slice(0, 200)}`);
+      }
+      const json = await resp.json();
+      verdicts = json.verdicts || [];
+      console.log("[mw] verdicts:", verdicts);
+    } catch (e) {
+      console.error("[mw] helper error:", e.message);
+      sendProgress(sourceTabId, { phase: "error", error: e.message });
+      return { error: e.message };
+    }
+  }
+
+  const updates = {};
+  for (const v of verdicts) {
+    const item = valid.find((s) => s.id === v.id);
+    updates[`verdict:${v.id}`] = {
+      ...v,
+      title: item?.title,
+      price: item?.price,
+      location: item?.location,
+      description: item?.description, // store so user can verify what was evaluated
+      distance_miles: item?.distance_miles,
+      drive_time_one_way_min: item?.drive_time_one_way_min,
+      round_trip_gas_cost: item?.round_trip_gas_cost,
+      round_trip_time_cost: item?.round_trip_time_cost,
+      evaluatedAt: Date.now(),
+    };
+  }
+  if (Object.keys(updates).length) {
+    await chrome.storage.local.set(updates);
+  }
+
+  const allVerdicts = listingIds.map((id) => {
+    if (cached[`verdict:${id}`]) return cached[`verdict:${id}`];
+    if (updates[`verdict:${id}`]) return updates[`verdict:${id}`];
+    const failed = scraped.find((s) => s.id === id && s.error);
+    return { id, error: failed ? failed.error : "evaluation failed" };
+  });
+
+  sendProgress(sourceTabId, { phase: "done" });
+  return { verdicts: allVerdicts };
+}
+
+async function scrapeListing(listingId) {
+  const url = `https://www.facebook.com/marketplace/item/${listingId}/`;
+  const tab = await chrome.tabs.create({ url, active: false });
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingScrapes.delete(listingId);
+      chrome.tabs.remove(tab.id).catch(() => {});
+      reject(new Error("scrape timeout"));
+    }, SCRAPE_TIMEOUT_MS);
+
+    pendingScrapes.set(listingId, {
+      resolve: (data) => {
+        chrome.tabs.remove(tab.id).catch(() => {});
+        resolve(data);
+      },
+      reject,
+      timer,
+      tabId: tab.id,
+    });
+  });
+}
+
+function sendProgress(tabId, payload) {
+  chrome.tabs.sendMessage(tabId, { type: "progress", ...payload }).catch(() => {});
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// --- Geocoding & trip-cost helpers --------------------------------------
+
+let lastNominatimAt = 0;
+
+async function geocode(query) {
+  if (!query || !query.trim()) return null;
+  const key = `geo:${query.trim().toLowerCase()}`;
+  const cached = (await chrome.storage.local.get(key))[key];
+  if (cached) return cached;
+
+  const wait = NOMINATIM_MIN_INTERVAL_MS - (Date.now() - lastNominatimAt);
+  if (wait > 0) await sleep(wait);
+  lastNominatimAt = Date.now();
+
+  // countrycodes=us biases lookups to US results — bare ZIP codes otherwise
+  // can match international postal codes (e.g. SF's 941xx collides with a
+  // postal code in Vladivostok). Revisit if non-US use is needed.
+  const url = `${NOMINATIM_URL}?q=${encodeURIComponent(query)}&format=json&limit=1&countrycodes=us`;
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      console.warn(`[mw] geocode ${query}: ${resp.status}`);
+      return null;
+    }
+    const arr = await resp.json();
+    if (!arr.length) return null;
+    const result = {
+      lat: parseFloat(arr[0].lat),
+      lng: parseFloat(arr[0].lon),
+      display: arr[0].display_name,
+    };
+    await chrome.storage.local.set({ [key]: result });
+    return result;
+  } catch (e) {
+    console.warn(`[mw] geocode ${query} failed:`, e.message);
+    return null;
+  }
+}
+
+async function getUserLocation() {
+  const stored = (await chrome.storage.local.get("user_location")).user_location;
+  if (!stored || !stored.raw) return null;
+  if (stored.lat != null && stored.lng != null) return stored;
+  const geo = await geocode(stored.raw);
+  if (!geo) return null;
+  const merged = { raw: stored.raw, ...geo };
+  await chrome.storage.local.set({ user_location: merged });
+  return merged;
+}
+
+let lastOsrmAt = 0;
+
+async function osrmRoute(from, to) {
+  const key = `route:${from.lat.toFixed(4)},${from.lng.toFixed(4)}>${to.lat.toFixed(4)},${to.lng.toFixed(4)}`;
+  const cached = (await chrome.storage.local.get(key))[key];
+  if (cached) return cached;
+
+  const wait = OSRM_MIN_INTERVAL_MS - (Date.now() - lastOsrmAt);
+  if (wait > 0) await sleep(wait);
+  lastOsrmAt = Date.now();
+
+  const url = `${OSRM_URL}/${from.lng},${from.lat};${to.lng},${to.lat}?overview=false`;
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      console.warn(`[mw] OSRM ${resp.status}`);
+      return null;
+    }
+    const data = await resp.json();
+    if (!data.routes || !data.routes.length) return null;
+    const r = data.routes[0];
+    const result = { meters: r.distance, seconds: r.duration };
+    await chrome.storage.local.set({ [key]: result });
+    return result;
+  } catch (e) {
+    console.warn("[mw] OSRM failed:", e.message);
+    return null;
+  }
+}
+
+function tripFromMilesAndMinutes(miles, minutesOneWay) {
+  const gas = ((miles * 2) / AVG_MPG) * GAS_COST_PER_GALLON;
+  const time = (minutesOneWay / 60) * 2 * HOURLY_TIME_COST;
+  return {
+    distance_miles: round1(miles),
+    drive_time_one_way_min: Math.round(minutesOneWay),
+    round_trip_gas_cost: round2(gas),
+    round_trip_time_cost: round2(time),
+  };
+}
+
+async function computeTrip(from, to) {
+  const route = await osrmRoute(from, to);
+  if (route) {
+    const miles = route.meters / 1609.344;
+    const minutes = route.seconds / 60;
+    return tripFromMilesAndMinutes(miles, minutes);
+  }
+  // OSRM unreachable — fall back to crow-flies estimate
+  const miles = haversineMiles(from, to) * FALLBACK_ROAD_FACTOR;
+  const minutes = (miles / FALLBACK_AVG_SPEED_MPH) * 60;
+  return tripFromMilesAndMinutes(miles, minutes);
+}
+
+function haversineMiles(a, b) {
+  const R = 3958.8; // earth radius in miles
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const lat1 = toRad(a.lat);
+  const lat2 = toRad(b.lat);
+  const x =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(x));
+}
+
+function round1(n) { return Math.round(n * 10) / 10; }
+function round2(n) { return Math.round(n * 100) / 100; }

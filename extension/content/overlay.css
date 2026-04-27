@@ -1,0 +1,110 @@
+.mw-checkbox {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 26px;
+  height: 26px;
+  background: rgba(255, 255, 255, 0.95);
+  border: 2px solid #1877f2;
+  border-radius: 4px;
+  font-size: 16px;
+  font-weight: bold;
+  line-height: 22px;
+  text-align: center;
+  cursor: pointer;
+  z-index: 9999;
+  user-select: none;
+  color: #1877f2;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+}
+.mw-checkbox.mw-checked {
+  background: #1877f2;
+  color: white;
+}
+
+.mw-badge {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  z-index: 9999;
+  user-select: none;
+  cursor: help;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
+}
+.mw-badge.mw-good {
+  background: #2e7d32;
+  color: white;
+}
+.mw-badge.mw-fair {
+  background: #f9a825;
+  color: black;
+}
+.mw-badge.mw-skip {
+  background: #c62828;
+  color: white;
+}
+.mw-badge.mw-error {
+  background: #555;
+  color: white;
+}
+
+#mw-bar {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 12px;
+  z-index: 99999;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+
+#mw-fab,
+#mw-clear,
+#mw-setloc {
+  padding: 12px 22px;
+  border: none;
+  border-radius: 24px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+  font-family: inherit;
+  max-width: 320px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#mw-setloc {
+  background: #2c3e50;
+  color: white;
+}
+#mw-setloc:hover {
+  background: #1a2733;
+}
+
+#mw-fab {
+  background: #1877f2;
+  color: white;
+}
+#mw-fab:disabled {
+  background: #999;
+  cursor: not-allowed;
+}
+#mw-fab:hover:not(:disabled) {
+  background: #166fe5;
+}
+
+#mw-clear {
+  background: #555;
+  color: white;
+}
+#mw-clear:hover {
+  background: #333;
+}
