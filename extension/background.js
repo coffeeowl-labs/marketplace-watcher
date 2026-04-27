@@ -12,7 +12,11 @@ const HELPER_URL = "http://127.0.0.1:8787/evaluate";
 const HELPER_HEALTH_URL = "http://127.0.0.1:8787/health";
 const HELPER_HEALTH_TIMEOUT_MS = 2000;
 const TAB_OPEN_DELAY_MS = 2000;
+// Scrape timer budget begins AFTER the tab signals "complete", so slow
+// first-tab page loads don't eat into the scraping window. The load
+// failsafe is the upper bound from tab creation if "complete" never fires.
 const SCRAPE_TIMEOUT_MS = 20000;
+const TAB_LOAD_FAILSAFE_MS = 30000;
 
 // Trip cost assumptions — refine in a later version with real per-vehicle data.
 const NOMINATIM_URL = "https://nominatim.openstreetmap.org/search";
@@ -39,11 +43,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg.type === "scraped") {
     const pending = pendingScrapes.get(msg.listingId);
-    if (pending) {
-      clearTimeout(pending.timer);
-      pendingScrapes.delete(msg.listingId);
-      pending.resolve(msg.data);
-    }
+    if (pending) pending.resolve(msg.data);
     sendResponse({ ok: true });
     return false;
   }
@@ -193,21 +193,51 @@ async function scrapeListing(listingId) {
   const tab = await chrome.tabs.create({ url, active: false });
 
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
+    let scrapeTimer = null;
+    let settled = false;
+
+    const cleanup = () => {
+      settled = true;
+      if (scrapeTimer) clearTimeout(scrapeTimer);
+      clearTimeout(loadFailsafeTimer);
+      chrome.tabs.onUpdated.removeListener(onTabUpdated);
       pendingScrapes.delete(listingId);
       chrome.tabs.remove(tab.id).catch(() => {});
-      reject(new Error("scrape timeout"));
-    }, SCRAPE_TIMEOUT_MS);
+    };
 
     pendingScrapes.set(listingId, {
       resolve: (data) => {
-        chrome.tabs.remove(tab.id).catch(() => {});
+        if (settled) return;
+        cleanup();
         resolve(data);
       },
-      reject,
-      timer,
+      reject: (err) => {
+        if (settled) return;
+        cleanup();
+        reject(err);
+      },
       tabId: tab.id,
     });
+
+    const armScrapeTimer = () => {
+      if (settled || scrapeTimer) return;
+      scrapeTimer = setTimeout(() => {
+        if (settled) return;
+        cleanup();
+        reject(new Error("scrape timeout"));
+      }, SCRAPE_TIMEOUT_MS);
+    };
+
+    const onTabUpdated = (id, info) => {
+      if (id !== tab.id || info.status !== "complete") return;
+      armScrapeTimer();
+    };
+    chrome.tabs.onUpdated.addListener(onTabUpdated);
+
+    // Failsafe in case "complete" never fires (some FB pages keep loading
+    // sub-resources indefinitely). After this window, start the scrape
+    // timer regardless so we don't hang forever.
+    const loadFailsafeTimer = setTimeout(armScrapeTimer, TAB_LOAD_FAILSAFE_MS);
   });
 }
 
