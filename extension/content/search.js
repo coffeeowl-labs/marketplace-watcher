@@ -12,9 +12,31 @@ let mutationDebounceTimer = null;
 (async () => {
   cachedVerdicts = await loadCachedVerdicts();
   ensureFAB();
+  await loadHideSkipsState();
   setupObserver();
   attachOverlays();
 })();
+
+async function loadHideSkipsState() {
+  const stored = (await chrome.storage.local.get("hide_skips")).hide_skips;
+  if (stored) document.body.classList.add("mw-hide-skips");
+  refreshHideSkipsLabel();
+}
+
+async function onHideSkipsClick() {
+  const enable = !document.body.classList.contains("mw-hide-skips");
+  document.body.classList.toggle("mw-hide-skips", enable);
+  await chrome.storage.local.set({ hide_skips: enable });
+  refreshHideSkipsLabel();
+}
+
+function refreshHideSkipsLabel() {
+  const btn = document.getElementById("mw-hideskips");
+  if (!btn) return;
+  const enabled = document.body.classList.contains("mw-hide-skips");
+  btn.textContent = enabled ? "Show All" : "Hide Skips";
+  btn.classList.toggle("mw-active", enabled);
+}
 
 async function loadCachedVerdicts() {
   const all = await chrome.storage.local.get(null);
@@ -151,6 +173,13 @@ function ensureFAB() {
   setLoc.textContent = "Set Location";
   setLoc.addEventListener("click", onSetLocationClick);
   bar.appendChild(setLoc);
+
+  const hideSkips = document.createElement("button");
+  hideSkips.id = "mw-hideskips";
+  hideSkips.type = "button";
+  hideSkips.textContent = "Hide Skips";
+  hideSkips.addEventListener("click", onHideSkipsClick);
+  bar.appendChild(hideSkips);
 
   const clear = document.createElement("button");
   clear.id = "mw-clear";
