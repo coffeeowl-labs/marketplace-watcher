@@ -88,9 +88,7 @@
 #mw-fab,
 #mw-clear,
 #mw-setloc,
-#mw-hideskips,
-#mw-hidefair,
-#mw-hidegood {
+#mw-filter {
   padding: 12px 22px;
   border: none;
   border-radius: 24px;
@@ -105,54 +103,87 @@
   text-overflow: ellipsis;
 }
 
-#mw-hideskips,
-#mw-hidefair,
-#mw-hidegood {
+#mw-filter {
   background: #6a4c93;
   color: white;
 }
-#mw-hideskips:hover,
-#mw-hidefair:hover,
-#mw-hidegood:hover {
+#mw-filter:hover {
   background: #503872;
 }
-
-/* Active state colors mirror the badge being hidden so the button doubles
-   as a legend. */
-#mw-hideskips.mw-active {
-  background: #c62828;
+#mw-filter.mw-active {
+  background: #4a148c;
   color: white;
 }
-#mw-hideskips.mw-active:hover {
-  background: #8e1818;
-}
-#mw-hidefair.mw-active {
-  background: #f9a825;
-  color: black;
-}
-#mw-hidefair.mw-active:hover {
-  background: #c98a18;
-}
-#mw-hidegood.mw-active {
-  background: #2e7d32;
-  color: white;
-}
-#mw-hidegood.mw-active:hover {
-  background: #1f5723;
+#mw-filter.mw-active:hover {
+  background: #2c0c5a;
 }
 
-/* When body has any of the toggle classes, the matching cards collapse out
-   of the grid via CSS :has(). Steal is intentionally never hidable — the
-   whole tool exists to surface those. */
-body.mw-hide-skips [data-mw-card="1"]:has(.mw-badge.mw-skip) {
-  display: none !important;
+/* Filter popover — anchored above the Filter button via #mw-filter-wrap. */
+#mw-filter-wrap {
+  position: relative;
 }
-body.mw-hide-fair [data-mw-card="1"]:has(.mw-badge.mw-fair) {
-  display: none !important;
+
+#mw-filter-popover {
+  position: absolute;
+  bottom: calc(100% + 12px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: #1a1a1a;
+  color: white;
+  padding: 12px 16px;
+  border-radius: 12px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.65);
+  display: none;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 180px;
+  font-family: inherit;
 }
-body.mw-hide-good [data-mw-card="1"]:has(.mw-badge.mw-good) {
-  display: none !important;
+#mw-filter-popover.mw-open {
+  display: flex;
 }
+
+.mw-filter-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  padding: 4px 0;
+  font-size: 14px;
+  user-select: none;
+}
+.mw-filter-row input[type="checkbox"] {
+  cursor: pointer;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+}
+
+.mw-filter-swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  flex-shrink: 0;
+  display: inline-block;
+}
+.mw-filter-swatch-steal {
+  background: linear-gradient(135deg, #ffd700 0%, #ff8a00 100%);
+}
+.mw-filter-swatch-good { background: #2e7d32; }
+.mw-filter-swatch-fair { background: #f9a825; }
+.mw-filter-swatch-skip { background: #c62828; }
+.mw-filter-swatch-unanalyzed {
+  background: white;
+  border: 2px solid #1877f2;
+}
+
+/* Hide rules — body class controls each kind. Body classes are added when
+   the user UNCHECKS that kind in the filter popover. */
+body.mw-hide-skip [data-mw-card="1"]:has(.mw-badge.mw-skip) { display: none !important; }
+body.mw-hide-fair [data-mw-card="1"]:has(.mw-badge.mw-fair) { display: none !important; }
+body.mw-hide-good [data-mw-card="1"]:has(.mw-badge.mw-good) { display: none !important; }
+body.mw-hide-steal [data-mw-card="1"]:has(.mw-badge.mw-steal) { display: none !important; }
+body.mw-hide-unanalyzed [data-mw-card="1"]:has(.mw-checkbox) { display: none !important; }
 
 #mw-setloc {
   background: #2c3e50;

@@ -9,63 +9,105 @@ const selectedIds = new Set();
 let cachedVerdicts = {}; // id -> verdict object
 let mutationDebounceTimer = null;
 
-// Each entry: storage key -> {bodyClass, buttonId, onLabel, offLabel}.
-// Order here is the order they appear in the bar.
-const HIDE_TOGGLES = {
-  hide_skips: {
-    bodyClass: "mw-hide-skips",
-    buttonId: "mw-hideskips",
-    offLabel: "Hide Skips",
-    onLabel: "Show Skips",
-  },
-  hide_fair: {
-    bodyClass: "mw-hide-fair",
-    buttonId: "mw-hidefair",
-    offLabel: "Hide Fair",
-    onLabel: "Show Fair",
-  },
-  hide_good: {
-    bodyClass: "mw-hide-good",
-    buttonId: "mw-hidegood",
-    offLabel: "Hide Good",
-    onLabel: "Show Good",
-  },
+// Display order of filter rows in the popover.
+const FILTER_KINDS = [
+  { key: "steal", label: "Steal" },
+  { key: "good", label: "Good" },
+  { key: "fair", label: "Fair" },
+  { key: "skip", label: "Skip" },
+  { key: "unanalyzed", label: "Unanalyzed" },
+];
+
+// All visible by default; persisted under `filter_visibility`.
+const filterState = {
+  steal: true,
+  good: true,
+  fair: true,
+  skip: true,
+  unanalyzed: true,
 };
 
 (async () => {
   cachedVerdicts = await loadCachedVerdicts();
   ensureFAB();
-  await loadHideToggleStates();
+  await loadFilterState();
   setupObserver();
   attachOverlays();
 })();
 
-async function loadHideToggleStates() {
-  const stored = await chrome.storage.local.get(Object.keys(HIDE_TOGGLES));
-  for (const [key, cfg] of Object.entries(HIDE_TOGGLES)) {
-    if (stored[key]) document.body.classList.add(cfg.bodyClass);
+async function loadFilterState() {
+  const stored = await chrome.storage.local.get([
+    "filter_visibility",
+    "hide_skips", "hide_fair", "hide_good", // legacy keys, migrate once
+  ]);
+  if (stored.filter_visibility) {
+    Object.assign(filterState, stored.filter_visibility);
+  } else if (stored.hide_skips || stored.hide_fair || stored.hide_good) {
+    if (stored.hide_skips) filterState.skip = false;
+    if (stored.hide_fair) filterState.fair = false;
+    if (stored.hide_good) filterState.good = false;
+    await chrome.storage.local.set({ filter_visibility: { ...filterState } });
+    await chrome.storage.local.remove(["hide_skips", "hide_fair", "hide_good"]);
   }
-  refreshHideToggleLabels();
+  applyFilterState();
 }
 
-function makeHideToggleHandler(key) {
-  return async () => {
-    const cfg = HIDE_TOGGLES[key];
-    const enable = !document.body.classList.contains(cfg.bodyClass);
-    document.body.classList.toggle(cfg.bodyClass, enable);
-    await chrome.storage.local.set({ [key]: enable });
-    refreshHideToggleLabels();
-  };
+function applyFilterState() {
+  for (const k of Object.keys(filterState)) {
+    document.body.classList.toggle(`mw-hide-${k}`, !filterState[k]);
+  }
+  refreshFilterButton();
+  refreshPopoverCheckboxes();
 }
 
-function refreshHideToggleLabels() {
-  for (const cfg of Object.values(HIDE_TOGGLES)) {
-    const btn = document.getElementById(cfg.buttonId);
-    if (!btn) continue;
-    const enabled = document.body.classList.contains(cfg.bodyClass);
-    btn.textContent = enabled ? cfg.onLabel : cfg.offLabel;
-    btn.classList.toggle("mw-active", enabled);
+async function toggleFilterKind(key) {
+  filterState[key] = !filterState[key];
+  await chrome.storage.local.set({ filter_visibility: { ...filterState } });
+  applyFilterState();
+}
+
+function refreshFilterButton() {
+  const btn = document.getElementById("mw-filter");
+  if (!btn) return;
+  const visible = Object.values(filterState).filter(Boolean).length;
+  const total = Object.keys(filterState).length;
+  btn.textContent = `Filter (${visible}/${total})`;
+  btn.classList.toggle("mw-active", visible < total);
+}
+
+function buildFilterPopover() {
+  const pop = document.createElement("div");
+  pop.id = "mw-filter-popover";
+  for (const kind of FILTER_KINDS) {
+    const row = document.createElement("label");
+    row.className = "mw-filter-row";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.dataset.kind = kind.key;
+    cb.addEventListener("change", () => toggleFilterKind(kind.key));
+    const swatch = document.createElement("span");
+    swatch.className = `mw-filter-swatch mw-filter-swatch-${kind.key}`;
+    const label = document.createElement("span");
+    label.textContent = kind.label;
+    row.append(cb, swatch, label);
+    pop.appendChild(row);
   }
+  return pop;
+}
+
+function refreshPopoverCheckboxes() {
+  const pop = document.getElementById("mw-filter-popover");
+  if (!pop) return;
+  for (const cb of pop.querySelectorAll("input[type=checkbox]")) {
+    cb.checked = !!filterState[cb.dataset.kind];
+  }
+}
+
+function toggleFilterPopover(force) {
+  const pop = document.getElementById("mw-filter-popover");
+  if (!pop) return;
+  const open = force !== undefined ? force : !pop.classList.contains("mw-open");
+  pop.classList.toggle("mw-open", open);
 }
 
 async function loadCachedVerdicts() {
@@ -204,14 +246,29 @@ function ensureFAB() {
   setLoc.addEventListener("click", onSetLocationClick);
   bar.appendChild(setLoc);
 
-  for (const [key, cfg] of Object.entries(HIDE_TOGGLES)) {
-    const btn = document.createElement("button");
-    btn.id = cfg.buttonId;
-    btn.type = "button";
-    btn.textContent = cfg.offLabel;
-    btn.addEventListener("click", makeHideToggleHandler(key));
-    bar.appendChild(btn);
-  }
+  // Filter button wraps its popover so the popover can be absolutely
+  // positioned relative to the button.
+  const filterWrap = document.createElement("div");
+  filterWrap.id = "mw-filter-wrap";
+  const filter = document.createElement("button");
+  filter.id = "mw-filter";
+  filter.type = "button";
+  filter.textContent = "Filter";
+  filter.addEventListener("click", (e) => {
+    e.stopPropagation();
+    toggleFilterPopover();
+  });
+  filterWrap.appendChild(filter);
+  filterWrap.appendChild(buildFilterPopover());
+  bar.appendChild(filterWrap);
+
+  // Click anywhere outside the popover closes it.
+  document.addEventListener("click", (e) => {
+    const pop = document.getElementById("mw-filter-popover");
+    if (!pop || !pop.classList.contains("mw-open")) return;
+    if (filterWrap.contains(e.target)) return;
+    toggleFilterPopover(false);
+  });
 
   const clear = document.createElement("button");
   clear.id = "mw-clear";
