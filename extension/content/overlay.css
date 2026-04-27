@@ -67,7 +67,8 @@
 #mw-fab,
 #mw-clear,
 #mw-setloc,
-#mw-hideskips {
+#mw-hideskips,
+#mw-hidefair {
   padding: 12px 22px;
   border: none;
   border-radius: 24px;
@@ -82,23 +83,39 @@
   text-overflow: ellipsis;
 }
 
-#mw-hideskips {
+#mw-hideskips,
+#mw-hidefair {
   background: #6a4c93;
   color: white;
 }
-#mw-hideskips:hover {
+#mw-hideskips:hover,
+#mw-hidefair:hover {
   background: #503872;
 }
+
+/* Active state colors mirror the badge being hidden so the button doubles
+   as a legend. */
 #mw-hideskips.mw-active {
   background: #c62828;
+  color: white;
 }
 #mw-hideskips.mw-active:hover {
   background: #8e1818;
 }
+#mw-hidefair.mw-active {
+  background: #f9a825;
+  color: black;
+}
+#mw-hidefair.mw-active:hover {
+  background: #c98a18;
+}
 
-/* When body has the toggle class, any card whose badge is a "skip"
-   collapses out of the grid via CSS :has(). */
+/* When body has either toggle class, the matching cards collapse out of
+   the grid via CSS :has(). */
 body.mw-hide-skips [data-mw-card="1"]:has(.mw-badge.mw-skip) {
+  display: none !important;
+}
+body.mw-hide-fair [data-mw-card="1"]:has(.mw-badge.mw-fair) {
   display: none !important;
 }
 

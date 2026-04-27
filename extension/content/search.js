@@ -9,33 +9,56 @@ const selectedIds = new Set();
 let cachedVerdicts = {}; // id -> verdict object
 let mutationDebounceTimer = null;
 
+// Each entry: storage key -> {bodyClass, buttonId, onLabel, offLabel}
+const HIDE_TOGGLES = {
+  hide_skips: {
+    bodyClass: "mw-hide-skips",
+    buttonId: "mw-hideskips",
+    offLabel: "Hide Skips",
+    onLabel: "Show Skips",
+  },
+  hide_fair: {
+    bodyClass: "mw-hide-fair",
+    buttonId: "mw-hidefair",
+    offLabel: "Hide Fair",
+    onLabel: "Show Fair",
+  },
+};
+
 (async () => {
   cachedVerdicts = await loadCachedVerdicts();
   ensureFAB();
-  await loadHideSkipsState();
+  await loadHideToggleStates();
   setupObserver();
   attachOverlays();
 })();
 
-async function loadHideSkipsState() {
-  const stored = (await chrome.storage.local.get("hide_skips")).hide_skips;
-  if (stored) document.body.classList.add("mw-hide-skips");
-  refreshHideSkipsLabel();
+async function loadHideToggleStates() {
+  const stored = await chrome.storage.local.get(Object.keys(HIDE_TOGGLES));
+  for (const [key, cfg] of Object.entries(HIDE_TOGGLES)) {
+    if (stored[key]) document.body.classList.add(cfg.bodyClass);
+  }
+  refreshHideToggleLabels();
 }
 
-async function onHideSkipsClick() {
-  const enable = !document.body.classList.contains("mw-hide-skips");
-  document.body.classList.toggle("mw-hide-skips", enable);
-  await chrome.storage.local.set({ hide_skips: enable });
-  refreshHideSkipsLabel();
+function makeHideToggleHandler(key) {
+  return async () => {
+    const cfg = HIDE_TOGGLES[key];
+    const enable = !document.body.classList.contains(cfg.bodyClass);
+    document.body.classList.toggle(cfg.bodyClass, enable);
+    await chrome.storage.local.set({ [key]: enable });
+    refreshHideToggleLabels();
+  };
 }
 
-function refreshHideSkipsLabel() {
-  const btn = document.getElementById("mw-hideskips");
-  if (!btn) return;
-  const enabled = document.body.classList.contains("mw-hide-skips");
-  btn.textContent = enabled ? "Show All" : "Hide Skips";
-  btn.classList.toggle("mw-active", enabled);
+function refreshHideToggleLabels() {
+  for (const cfg of Object.values(HIDE_TOGGLES)) {
+    const btn = document.getElementById(cfg.buttonId);
+    if (!btn) continue;
+    const enabled = document.body.classList.contains(cfg.bodyClass);
+    btn.textContent = enabled ? cfg.onLabel : cfg.offLabel;
+    btn.classList.toggle("mw-active", enabled);
+  }
 }
 
 async function loadCachedVerdicts() {
@@ -174,12 +197,14 @@ function ensureFAB() {
   setLoc.addEventListener("click", onSetLocationClick);
   bar.appendChild(setLoc);
 
-  const hideSkips = document.createElement("button");
-  hideSkips.id = "mw-hideskips";
-  hideSkips.type = "button";
-  hideSkips.textContent = "Hide Skips";
-  hideSkips.addEventListener("click", onHideSkipsClick);
-  bar.appendChild(hideSkips);
+  for (const [key, cfg] of Object.entries(HIDE_TOGGLES)) {
+    const btn = document.createElement("button");
+    btn.id = cfg.buttonId;
+    btn.type = "button";
+    btn.textContent = cfg.offLabel;
+    btn.addEventListener("click", makeHideToggleHandler(key));
+    bar.appendChild(btn);
+  }
 
   const clear = document.createElement("button");
   clear.id = "mw-clear";
