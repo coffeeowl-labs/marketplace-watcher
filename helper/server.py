@@ -13,7 +13,7 @@ import json
 import re
 import subprocess
 import sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOST = "127.0.0.1"
 PORT = 8787
@@ -99,20 +99,28 @@ def parse_claude_json(stdout):
 
 def evaluate(listings):
     user_prompt = build_user_prompt(listings)
+    print(
+        f"[helper] evaluating {len(listings)} listings, prompt={len(user_prompt)} chars",
+        flush=True,
+    )
+    # Pass the user prompt via stdin so very large batches don't push us up
+    # against MAX_ARG_STRLEN. The system prompt stays on argv (small, fixed).
     proc = subprocess.run(
         [
             "claude",
             "-p",
             "--model", "sonnet",
             "--append-system-prompt", SYSTEM_PROMPT,
-            user_prompt,
         ],
+        input=user_prompt,
         capture_output=True,
         text=True,
         timeout=CLAUDE_TIMEOUT_SECONDS,
     )
     if proc.returncode != 0:
-        raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr.strip()}")
+        raise RuntimeError(
+            f"claude exited {proc.returncode}: {proc.stderr.strip()[:500]}"
+        )
 
     verdicts = parse_claude_json(proc.stdout)
 
@@ -122,6 +130,7 @@ def evaluate(listings):
         raise RuntimeError(
             f"verdict id mismatch. sent={sent_ids} got={got_ids}"
         )
+    print(f"[helper] returned {len(verdicts)} verdicts", flush=True)
     return verdicts
 
 
@@ -151,42 +160,56 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path != "/evaluate":
-            self._send_json(404, {"error": "not found"})
-            return
-        length = int(self.headers.get("Content-Length", "0"))
+        # Outer try ensures the client always gets *some* JSON response, even
+        # for unexpected errors that would otherwise crash the request and
+        # surface as a CORS/network failure on the browser side.
         try:
-            body = json.loads(self.rfile.read(length))
-        except json.JSONDecodeError as e:
-            self._send_json(400, {"error": f"invalid JSON: {e}"})
-            return
-
-        listings = body.get("listings")
-        if not isinstance(listings, list) or not listings:
-            self._send_json(400, {"error": "missing or empty 'listings' array"})
-            return
-        if len(listings) > 20:
-            self._send_json(400, {"error": "max 20 listings per batch"})
-            return
-        for item in listings:
-            if not isinstance(item, dict) or "id" not in item:
-                self._send_json(400, {"error": "each listing must be an object with an 'id'"})
+            if self.path != "/evaluate":
+                self._send_json(404, {"error": "not found"})
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                body = json.loads(self.rfile.read(length))
+            except json.JSONDecodeError as e:
+                self._send_json(400, {"error": f"invalid JSON: {e}"})
                 return
 
-        try:
-            verdicts = evaluate(listings)
-            self._send_json(200, {"verdicts": verdicts})
-        except subprocess.TimeoutExpired:
-            self._send_json(504, {"error": "claude timed out"})
+            listings = body.get("listings")
+            if not isinstance(listings, list) or not listings:
+                self._send_json(400, {"error": "missing or empty 'listings' array"})
+                return
+            if len(listings) > 20:
+                self._send_json(400, {"error": "max 20 listings per batch"})
+                return
+            for item in listings:
+                if not isinstance(item, dict) or "id" not in item:
+                    self._send_json(400, {"error": "each listing must have an 'id'"})
+                    return
+
+            try:
+                verdicts = evaluate(listings)
+                self._send_json(200, {"verdicts": verdicts})
+            except subprocess.TimeoutExpired:
+                print("[helper] claude TIMEOUT", flush=True)
+                self._send_json(504, {"error": "claude timed out"})
+            except Exception as e:
+                import traceback
+                print(f"[helper] evaluate error: {e}\n{traceback.format_exc()}", flush=True)
+                self._send_json(500, {"error": str(e)})
         except Exception as e:
-            self._send_json(500, {"error": str(e)})
+            import traceback
+            print(f"[helper] handler error: {e}\n{traceback.format_exc()}", flush=True)
+            try:
+                self._send_json(500, {"error": f"handler crashed: {e}"})
+            except Exception:
+                pass
 
     def log_message(self, fmt, *args):
         sys.stderr.write(f"[{self.log_date_time_string()}] {fmt % args}\n")
 
 
 def main():
-    server = HTTPServer((HOST, PORT), Handler)
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"marketplace_watcher helper listening on http://{HOST}:{PORT}")
     try:
         server.serve_forever()
