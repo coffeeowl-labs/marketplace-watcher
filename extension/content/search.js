@@ -101,6 +101,11 @@ function attachBadge(card, verdict) {
   const v = verdict.verdict || "error";
   badge.className = `mw-badge mw-${v}`;
   badge.textContent = (verdict.error ? "ERR" : v).toUpperCase();
+  badge.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    onReEvaluateBadge(verdict.id);
+  });
   // Tooltip surfaces the full scraped payload alongside the verdict so
   // we can sanity-check what the model actually saw.
   const lines = [];
@@ -124,6 +129,7 @@ function attachBadge(card, verdict) {
     const d = verdict.description;
     lines.push(`\nDescription (${d.length} chars):\n${d.slice(0, 600)}${d.length > 600 ? "…" : ""}`);
   }
+  lines.push("\n(right-click to re-evaluate)");
   badge.title = lines.join("\n");
   card.appendChild(badge);
 }
@@ -232,6 +238,41 @@ function flashFAB(text) {
     fab.textContent = prev;
     updateFAB();
   }, 1500);
+}
+
+async function onReEvaluateBadge(id) {
+  const v = cachedVerdicts[id];
+  const label = v?.title ? `"${v.title}"` : id;
+  if (!confirm(`Re-evaluate ${label}?`)) return;
+
+  delete cachedVerdicts[id];
+  await chrome.storage.local.remove(`verdict:${id}`);
+
+  await ensureUserLocation();
+
+  const fab = document.getElementById("mw-fab");
+  fab.disabled = true;
+  fab.textContent = "Re-evaluating…";
+
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "evaluate",
+      listingIds: [id],
+    });
+    if (!response || response.error) {
+      fab.textContent = `Error: ${response?.error || "no response"}`;
+      setTimeout(updateFAB, 5000);
+      return;
+    }
+    for (const nv of response.verdicts || []) {
+      cachedVerdicts[nv.id] = nv;
+    }
+    refreshAllOverlays();
+    updateFAB();
+  } catch (e) {
+    fab.textContent = `Error: ${e.message}`;
+    setTimeout(updateFAB, 5000);
+  }
 }
 
 async function onEvaluateClick() {
