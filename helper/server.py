@@ -17,7 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOST = "127.0.0.1"
 PORT = 8787
-CLAUDE_TIMEOUT_SECONDS = 180
+CLAUDE_TIMEOUT_SECONDS = 420  # 7 min — enough for a 20-listing batch with full descriptions and trip data on Sonnet
 DESCRIPTION_CHAR_CAP = 2000
 
 SYSTEM_PROMPT = """You are evaluating Facebook Marketplace listings for whether the asking price represents good value.
