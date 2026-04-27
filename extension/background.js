@@ -9,6 +9,8 @@
 //   4. Persist new verdicts to storage and return full set to the search page
 
 const HELPER_URL = "http://127.0.0.1:8787/evaluate";
+const HELPER_HEALTH_URL = "http://127.0.0.1:8787/health";
+const HELPER_HEALTH_TIMEOUT_MS = 2000;
 const TAB_OPEN_DELAY_MS = 2000;
 const SCRAPE_TIMEOUT_MS = 20000;
 
@@ -47,7 +49,30 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 });
 
+async function checkHelperHealth() {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), HELPER_HEALTH_TIMEOUT_MS);
+  try {
+    const resp = await fetch(HELPER_HEALTH_URL, { signal: ctrl.signal });
+    return resp.ok;
+  } catch (e) {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function handleEvaluate(listingIds, sourceTabId) {
+  // Fail-fast: a 40-second scrape phase is wasted effort if the helper
+  // isn't running. Confirm reachability before we open any tabs.
+  const helperUp = await checkHelperHealth();
+  if (!helperUp) {
+    const msg = "Helper not running — start it with: python3 helper/server.py";
+    console.warn("[mw] " + msg);
+    sendProgress(sourceTabId, { phase: "error", error: msg });
+    return { error: msg };
+  }
+
   const cacheKeys = listingIds.map((id) => `verdict:${id}`);
   const cached = await chrome.storage.local.get(cacheKeys);
   const uncachedIds = listingIds.filter((id) => !cached[`verdict:${id}`]);
