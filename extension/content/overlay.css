@@ -193,7 +193,7 @@ body.mw-hide-fair [data-mw-card="1"]:has(.mw-badge.mw-fair) { display: none !imp
 body.mw-hide-good [data-mw-card="1"]:has(.mw-badge.mw-good) { display: none !important; }
 body.mw-hide-steal [data-mw-card="1"]:has(.mw-badge.mw-steal) { display: none !important; }
 body.mw-hide-unanalyzed [data-mw-card="1"]:has(.mw-checkbox) { display: none !important; }
-body.mw-hide-sponsored [data-mw-card="1"][data-mw-sponsored="1"] { display: none !important; }
+body.mw-hide-sponsored [data-mw-sponsored="1"] { display: none !important; }
 
 #mw-setloc {
   background: #2c3e50;

@@ -148,22 +148,42 @@ function attachOverlays() {
     const cs = getComputedStyle(card);
     if (cs.position === "static") card.style.position = "relative";
 
-    if (isSponsored(link)) card.dataset.mwSponsored = "1";
-
     if (cachedVerdicts[id]) {
       attachBadge(card, cachedVerdicts[id]);
     } else {
       attachCheckbox(card, id);
     }
   }
+  markSponsoredCards();
 }
 
-function isSponsored(link) {
-  // FB labels Marketplace ad listings with the literal text "Sponsored"
-  // (or occasionally "Promoted") inline within the card. Matching the
-  // word boundary keeps "sponsorship", "sponsored race bike", etc. out.
-  const text = link.innerText || link.textContent || "";
-  return /\b(?:Sponsored|Promoted)\b/.test(text);
+function markSponsoredCards() {
+  // Marketplace ads are cards whose <a href> points directly at the
+  // advertiser's external site (e.g. fiido.com, lectricebikes.com)
+  // instead of /marketplace/item/<id>. The destination URL is the most
+  // reliable signal — FB can obfuscate "Sponsored" labels but can't
+  // change where the ad needs to send the click.
+  const main = document.querySelector('[role="main"]') || document.body;
+  for (const link of main.querySelectorAll("a[href]")) {
+    if (link.dataset.mwSponsoredChecked === "1") continue;
+
+    let host;
+    try {
+      host = new URL(link.href, location.href).hostname.toLowerCase();
+    } catch {
+      continue;
+    }
+    if (!host || host.endsWith("facebook.com") || host === "fb.com") continue;
+
+    // Card-shaped only — keeps footer/profile/icon links from being
+    // mismarked as sponsored cards.
+    const r = link.getBoundingClientRect();
+    if (r.width < 120 || r.height < 120) continue;
+
+    link.dataset.mwSponsoredChecked = "1";
+    const card = link.parentElement || link;
+    card.dataset.mwSponsored = "1";
+  }
 }
 
 function attachCheckbox(card, id) {
