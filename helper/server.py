@@ -9,16 +9,22 @@ Why a local helper at all: a Firefox extension cannot spawn subprocesses,
 so we bridge to the Claude CLI through a localhost-only HTTP endpoint.
 """
 
+import concurrent.futures
 import json
 import re
 import subprocess
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOST = "127.0.0.1"
 PORT = 8787
 CLAUDE_TIMEOUT_SECONDS = 420  # 7 min — enough for a 20-listing batch with full descriptions and trip data on Sonnet
 DESCRIPTION_CHAR_CAP = 2000
+# Listings per parallel claude subprocess. 5 hits a sweet spot: each chunk
+# completes in ~30–60s on Sonnet, claude CLI startup cost (~3–5s) is amortized,
+# and a 20-batch fans out to 4 concurrent processes.
+CHUNK_SIZE = 5
 
 SYSTEM_PROMPT = """You are evaluating Facebook Marketplace listings for whether the asking price represents good value.
 
@@ -130,8 +136,37 @@ def evaluate(listings):
         raise RuntimeError(
             f"verdict id mismatch. sent={sent_ids} got={got_ids}"
         )
-    print(f"[helper] returned {len(verdicts)} verdicts", flush=True)
+    print(f"[helper] chunk returned {len(verdicts)} verdicts", flush=True)
     return verdicts
+
+
+def evaluate_parallel(listings):
+    """Split into chunks of CHUNK_SIZE and run each chunk in its own
+    claude subprocess concurrently. Returns verdicts in original order."""
+    if len(listings) <= CHUNK_SIZE:
+        return evaluate(listings)
+
+    chunks = [
+        listings[i : i + CHUNK_SIZE]
+        for i in range(0, len(listings), CHUNK_SIZE)
+    ]
+    print(
+        f"[helper] fanning out {len(listings)} listings into {len(chunks)} parallel chunks",
+        flush=True,
+    )
+    started = time.time()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(chunks)) as ex:
+        futures = [ex.submit(evaluate, chunk) for chunk in chunks]
+        # Collect in submission order so flattened verdicts preserve input order.
+        results = [f.result() for f in futures]
+
+    elapsed = time.time() - started
+    print(
+        f"[helper] all {len(chunks)} chunks complete in {elapsed:.1f}s",
+        flush=True,
+    )
+    return [v for batch in results for v in batch]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -187,7 +222,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
 
             try:
-                verdicts = evaluate(listings)
+                verdicts = evaluate_parallel(listings)
                 self._send_json(200, {"verdicts": verdicts})
             except subprocess.TimeoutExpired:
                 print("[helper] claude TIMEOUT", flush=True)

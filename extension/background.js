@@ -32,7 +32,14 @@ const AVG_MPG = 25;
 const FALLBACK_AVG_SPEED_MPH = 40;
 const FALLBACK_ROAD_FACTOR = 1.3;
 
-const pendingScrapes = new Map(); // listingId -> {resolve, reject, timer, tabId}
+const pendingScrapes = new Map(); // listingId -> {resolve, reject, tabId}
+
+// Eager scrape pipeline: as soon as a checkbox is checked we start scraping
+// in the background. By the time the user clicks Evaluate, most or all of
+// the data is already in the `scraped:<id>` cache.
+const scrapeQueue = []; // FIFO of {id, resolve, reject}
+const scrapeInFlight = new Map(); // listingId -> Promise<scrapedData>
+let scrapeWorkerRunning = false;
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "evaluate") {
@@ -41,6 +48,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       .catch((e) => sendResponse({ error: e.message }));
     return true; // async response
   }
+  if (msg.type === "prefetch") {
+    // Fire-and-forget: queue the scrape but don't make the sender wait.
+    enqueueScrape(msg.listingId).catch(() => {});
+    sendResponse({ ok: true });
+    return false;
+  }
   if (msg.type === "scraped") {
     const pending = pendingScrapes.get(msg.listingId);
     if (pending) pending.resolve(msg.data);
@@ -48,6 +61,54 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return false;
   }
 });
+
+async function enqueueScrape(id) {
+  // Cache hit?
+  const cacheKey = `scraped:${id}`;
+  const cached = (await chrome.storage.local.get(cacheKey))[cacheKey];
+  if (cached) return cached;
+
+  // Already in flight?
+  if (scrapeInFlight.has(id)) return scrapeInFlight.get(id);
+
+  const promise = new Promise((resolve, reject) => {
+    scrapeQueue.push({ id, resolve, reject });
+  });
+  scrapeInFlight.set(id, promise);
+
+  if (!scrapeWorkerRunning) startScrapeWorker();
+  return promise;
+}
+
+async function startScrapeWorker() {
+  scrapeWorkerRunning = true;
+  const userLoc = await getUserLocation();
+
+  while (scrapeQueue.length > 0) {
+    const { id, resolve, reject } = scrapeQueue.shift();
+    try {
+      console.log(`[mw] eager-scraping ${id} (queue: ${scrapeQueue.length} remaining)`);
+      const data = await scrapeListing(id);
+      let enriched = { ...data };
+      if (userLoc && data.location) {
+        const listingGeo = await geocode(data.location);
+        if (listingGeo) {
+          const trip = await computeTrip(userLoc, listingGeo);
+          Object.assign(enriched, trip);
+        }
+      }
+      await chrome.storage.local.set({ [`scraped:${id}`]: enriched });
+      resolve(enriched);
+    } catch (e) {
+      console.warn(`[mw] eager scrape failed ${id}:`, e.message);
+      reject(e);
+    } finally {
+      scrapeInFlight.delete(id);
+    }
+    if (scrapeQueue.length > 0) await sleep(TAB_OPEN_DELAY_MS);
+  }
+  scrapeWorkerRunning = false;
+}
 
 async function checkHelperHealth() {
   const ctrl = new AbortController();
@@ -85,52 +146,46 @@ async function handleEvaluate(listingIds, sourceTabId) {
 
   console.log("[mw] evaluate request", { listingIds, cached: listingIds.length - uncachedIds.length, uncached: uncachedIds.length });
 
-  const userLoc = await getUserLocation();
-  if (userLoc) {
-    console.log(`[mw] user location: ${userLoc.display} (${userLoc.lat}, ${userLoc.lng})`);
-  } else {
-    console.log("[mw] no user location set or geocoding failed; trip costs disabled");
-  }
+  // Queue all scrapes through the shared enqueueScrape — this dedupes
+  // against any already-running eager prefetch and uses the storage cache
+  // for items that finished pre-scraping while the user was curating.
+  let done = 0;
+  sendProgress(sourceTabId, {
+    phase: "fetching",
+    total: uncachedIds.length,
+    done,
+  });
 
-  const scraped = [];
-  for (let i = 0; i < uncachedIds.length; i++) {
-    const id = uncachedIds[i];
-    console.log(`[mw] scraping ${i + 1}/${uncachedIds.length}: ${id}`);
-    try {
-      const data = await scrapeListing(id);
-      console.log(`[mw] scraped ${id}:`, {
-        title: data.title,
-        price: data.price,
-        location: data.location,
-        descChars: (data.description || "").length,
-        descPreview: (data.description || "").slice(0, 120),
-      });
-
-      const enriched = { id, ...data };
-      if (userLoc && data.location) {
-        const listingGeo = await geocode(data.location);
-        if (listingGeo) {
-          const trip = await computeTrip(userLoc, listingGeo);
-          Object.assign(enriched, trip);
-          console.log(`[mw] trip ${id}:`, trip);
-        } else {
-          console.log(`[mw] could not geocode listing location: ${data.location}`);
-        }
+  const scraped = await Promise.all(
+    uncachedIds.map(async (id) => {
+      try {
+        const data = await enqueueScrape(id);
+        done += 1;
+        sendProgress(sourceTabId, {
+          phase: "fetching",
+          total: uncachedIds.length,
+          done,
+        });
+        console.log(`[mw] ready ${id}:`, {
+          title: data.title,
+          price: data.price,
+          location: data.location,
+          descChars: (data.description || "").length,
+          distance_miles: data.distance_miles,
+        });
+        return { id, ...data };
+      } catch (e) {
+        done += 1;
+        sendProgress(sourceTabId, {
+          phase: "fetching",
+          total: uncachedIds.length,
+          done,
+        });
+        console.warn(`[mw] scrape failed ${id}:`, e.message);
+        return { id, error: e.message };
       }
-      scraped.push(enriched);
-    } catch (e) {
-      console.warn(`[mw] scrape failed ${id}:`, e.message);
-      scraped.push({ id, error: e.message });
-    }
-    sendProgress(sourceTabId, {
-      phase: "fetching",
-      total: uncachedIds.length,
-      done: i + 1,
-    });
-    if (i < uncachedIds.length - 1) {
-      await sleep(TAB_OPEN_DELAY_MS);
-    }
-  }
+    })
+  );
 
   const valid = scraped.filter((s) => !s.error);
   let verdicts = [];

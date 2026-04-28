@@ -16,15 +16,18 @@ const FILTER_KINDS = [
   { key: "fair", label: "Fair" },
   { key: "skip", label: "Skip" },
   { key: "unanalyzed", label: "Unanalyzed" },
+  { key: "sponsored", label: "Sponsored / Ads" },
 ];
 
-// All visible by default; persisted under `filter_visibility`.
+// All visible by default except sponsored (nobody wants ads in their results).
+// Persisted under `filter_visibility`.
 const filterState = {
   steal: true,
   good: true,
   fair: true,
   skip: true,
   unanalyzed: true,
+  sponsored: false,
 };
 
 (async () => {
@@ -145,12 +148,22 @@ function attachOverlays() {
     const cs = getComputedStyle(card);
     if (cs.position === "static") card.style.position = "relative";
 
+    if (isSponsored(link)) card.dataset.mwSponsored = "1";
+
     if (cachedVerdicts[id]) {
       attachBadge(card, cachedVerdicts[id]);
     } else {
       attachCheckbox(card, id);
     }
   }
+}
+
+function isSponsored(link) {
+  // FB labels Marketplace ad listings with the literal text "Sponsored"
+  // (or occasionally "Promoted") inline within the card. Matching the
+  // word boundary keeps "sponsorship", "sponsored race bike", etc. out.
+  const text = link.innerText || link.textContent || "";
+  return /\b(?:Sponsored|Promoted)\b/.test(text);
 }
 
 function attachCheckbox(card, id) {
@@ -180,6 +193,12 @@ function attachCheckbox(card, id) {
           return;
         }
         selectedIds.add(id);
+        // Eagerly start scraping so the data is ready (or close to it) by
+        // the time the user clicks Evaluate. Fire-and-forget; the queue
+        // dedupes against any in-flight scrape.
+        chrome.runtime
+          .sendMessage({ type: "prefetch", listingId: id })
+          .catch(() => {});
       }
       apply();
       updateFAB();
@@ -364,7 +383,9 @@ async function onReEvaluateBadge(id) {
   if (!confirm(`Re-evaluate ${label}?`)) return;
 
   delete cachedVerdicts[id];
-  await chrome.storage.local.remove(`verdict:${id}`);
+  // Drop both verdict and scraped cache so re-evaluation does a fresh
+  // scrape — listing prices and descriptions can change.
+  await chrome.storage.local.remove([`verdict:${id}`, `scraped:${id}`]);
 
   await ensureUserLocation();
 
