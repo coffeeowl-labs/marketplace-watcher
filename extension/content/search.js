@@ -163,6 +163,12 @@ function markSponsoredCards() {
   // instead of /marketplace/item/<id>. The destination URL is the most
   // reliable signal — FB can obfuscate "Sponsored" labels but can't
   // change where the ad needs to send the click.
+  //
+  // FB nests several <a> tags per card (a hidden one + a "Visit site"
+  // button + the main image link), and several layers of wrappers. The
+  // visible card is usually 4-8 levels up from any individual link. We
+  // walk up until we find a card-sized ancestor (at least ~180×180) and
+  // mark THAT — marking the immediate parent hits a 0x0 wrapper.
   const main = document.querySelector('[role="main"]') || document.body;
   for (const link of main.querySelectorAll("a[href]")) {
     if (link.dataset.mwSponsoredChecked === "1") continue;
@@ -175,14 +181,16 @@ function markSponsoredCards() {
     }
     if (!host || host.endsWith("facebook.com") || host === "fb.com") continue;
 
-    // Card-shaped only — keeps footer/profile/icon links from being
-    // mismarked as sponsored cards.
-    const r = link.getBoundingClientRect();
-    if (r.width < 120 || r.height < 120) continue;
-
     link.dataset.mwSponsoredChecked = "1";
-    const card = link.parentElement || link;
-    card.dataset.mwSponsored = "1";
+
+    let el = link.parentElement;
+    for (let depth = 0; depth < 12 && el; depth++, el = el.parentElement) {
+      const r = el.getBoundingClientRect();
+      if (r.width >= 180 && r.height >= 180) {
+        el.dataset.mwSponsored = "1";
+        break;
+      }
+    }
   }
 }
 
