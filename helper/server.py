@@ -198,6 +198,12 @@ class Handler(BaseHTTPRequestHandler):
         # Outer try ensures the client always gets *some* JSON response, even
         # for unexpected errors that would otherwise crash the request and
         # surface as a CORS/network failure on the browser side.
+        #
+        # BrokenPipeError specifically means the client disconnected before
+        # we could send the response (typically because the extension's
+        # background event page got suspended). The verdict work already
+        # completed; nothing actionable on our side. Log briefly and move on
+        # rather than spewing a full traceback.
         try:
             if self.path != "/evaluate":
                 self._send_json(404, {"error": "not found"})
@@ -224,13 +230,29 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 verdicts = evaluate_parallel(listings)
                 self._send_json(200, {"verdicts": verdicts})
+            except BrokenPipeError:
+                print(
+                    "[helper] client disconnected before we could send the response "
+                    "(verdicts were computed successfully but lost)",
+                    flush=True,
+                )
+                return  # don't try to send another response on a dead socket
             except subprocess.TimeoutExpired:
                 print("[helper] claude TIMEOUT", flush=True)
-                self._send_json(504, {"error": "claude timed out"})
+                try:
+                    self._send_json(504, {"error": "claude timed out"})
+                except BrokenPipeError:
+                    pass
             except Exception as e:
                 import traceback
                 print(f"[helper] evaluate error: {e}\n{traceback.format_exc()}", flush=True)
-                self._send_json(500, {"error": str(e)})
+                try:
+                    self._send_json(500, {"error": str(e)})
+                except BrokenPipeError:
+                    pass
+        except BrokenPipeError:
+            # Client gone; nothing we can do.
+            return
         except Exception as e:
             import traceback
             print(f"[helper] handler error: {e}\n{traceback.format_exc()}", flush=True)

@@ -304,6 +304,15 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// Firefox MV3 background scripts are non-persistent event pages and can be
+// suspended after ~30s of "inactivity." Active fetches *should* count, but
+// the implementation occasionally drops long requests, surfacing as a
+// BrokenPipeError on the helper side. Poking a chrome.runtime API every
+// 20s registers as activity and keeps the page alive across long batches.
+setInterval(() => {
+  chrome.runtime.getPlatformInfo().catch(() => {});
+}, 20000);
+
 // --- Geocoding & trip-cost helpers --------------------------------------
 
 let lastNominatimAt = 0;
