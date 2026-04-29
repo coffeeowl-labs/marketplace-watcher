@@ -62,8 +62,8 @@
   color: white;
 }
 .mw-badge.mw-fair {
-  background: #f9a825;
-  color: black;
+  background: #455a64;
+  color: white;
 }
 .mw-badge.mw-skip {
   background: #c62828;
@@ -170,7 +170,7 @@
   background: linear-gradient(135deg, #ffd700 0%, #ff8a00 100%);
 }
 .mw-filter-swatch-good { background: #2e7d32; }
-.mw-filter-swatch-fair { background: #f9a825; }
+.mw-filter-swatch-fair { background: #455a64; }
 .mw-filter-swatch-skip { background: #c62828; }
 .mw-filter-swatch-unanalyzed {
   background: white;
