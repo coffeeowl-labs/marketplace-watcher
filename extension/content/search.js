@@ -309,6 +309,9 @@ function attachBadge(card, verdict) {
     const d = verdict.description;
     lines.push(`\nDescription (${d.length} chars):\n${d.slice(0, 600)}${d.length > 600 ? "…" : ""}`);
   }
+  if (verdict.images_included) {
+    lines.push(`\nPhotos analyzed: ${verdict.image_count}`);
+  }
   const ctx = cachedContexts[verdict.id];
   if (ctx) lines.push(`\nUser notes:\n${ctx}`);
   lines.push("\n(right-click to add context / re-evaluate)");
@@ -447,7 +450,7 @@ function flashFAB(text) {
   }, 1500);
 }
 
-async function reEvaluateListing(id) {
+async function reEvaluateListing(id, options = {}) {
   delete cachedVerdicts[id];
   // Drop both verdict and scraped cache so re-evaluation does a fresh
   // scrape — listing prices and descriptions can change. We deliberately
@@ -458,12 +461,15 @@ async function reEvaluateListing(id) {
 
   const fab = document.getElementById("mw-fab");
   fab.disabled = true;
-  fab.textContent = "Re-evaluating…";
+  fab.textContent = options.includeImages
+    ? "Re-evaluating with photos…"
+    : "Re-evaluating…";
 
   try {
     const response = await chrome.runtime.sendMessage({
       type: "evaluate",
       listingIds: [id],
+      options: { includeImages: !!options.includeImages },
     });
     if (!response || response.error) {
       fab.textContent = `Error: ${response?.error || "no response"}`;
@@ -485,12 +491,21 @@ async function reEvaluateListing(id) {
 // context (e.g. "rusty, kept outside") that will be appended to the
 // description on the next analysis. Notes persist across re-analyses
 // until cleared explicitly.
-function openContextPopup(id) {
+async function openContextPopup(id) {
   // Don't stack popups.
   if (document.getElementById("mw-modal-backdrop")) return;
 
   const verdict = cachedVerdicts[id];
   const existing = cachedContexts[id] || "";
+
+  // Image count comes from the cached scrape so we can label the checkbox
+  // accurately. If the scrape predates the image-scrape feature, this is
+  // undefined — treat as "unknown, will be attempted on re-scrape".
+  const scrapedKey = `scraped:${id}`;
+  const scrapedRecord = (await chrome.storage.local.get(scrapedKey))[scrapedKey];
+  const imageCount = Array.isArray(scrapedRecord?.images)
+    ? scrapedRecord.images.length
+    : null;
 
   const backdrop = document.createElement("div");
   backdrop.id = "mw-modal-backdrop";
@@ -523,6 +538,26 @@ function openContextPopup(id) {
   ta.value = existing;
   ta.placeholder = "e.g. bike looks rusty, probably kept outside in the rain";
   modal.appendChild(ta);
+
+  const imageRow = document.createElement("label");
+  imageRow.className = "mw-modal-image-row";
+  const imageCb = document.createElement("input");
+  imageCb.type = "checkbox";
+  imageCb.checked = false;
+  const imageLabel = document.createElement("span");
+  if (imageCount === 0) {
+    imageRow.classList.add("mw-disabled");
+    imageCb.disabled = true;
+    imageLabel.textContent = "No photos detected on this listing";
+  } else if (imageCount == null) {
+    imageLabel.textContent =
+      "Include photos in re-analysis (count unknown — will attempt to fetch)";
+  } else {
+    imageLabel.textContent = `Include photos in re-analysis (${imageCount} detected)`;
+  }
+  imageRow.appendChild(imageCb);
+  imageRow.appendChild(imageLabel);
+  modal.appendChild(imageRow);
 
   const buttons = document.createElement("div");
   buttons.className = "mw-modal-buttons";
@@ -572,9 +607,10 @@ function openContextPopup(id) {
   });
 
   mkBtn("Save & Re-analyze", "mw-modal-primary", async () => {
+    const includeImages = imageCb.checked;
     await saveOnly();
     close();
-    reEvaluateListing(id);
+    reEvaluateListing(id, { includeImages });
   });
 
   // Backdrop click closes; clicks inside the modal don't bubble.
@@ -644,6 +680,8 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (!fab) return;
   if (msg.phase === "fetching") {
     fab.textContent = `Fetching ${msg.done}/${msg.total}…`;
+  } else if (msg.phase === "images") {
+    fab.textContent = "Downloading photos…";
   } else if (msg.phase === "evaluating") {
     fab.textContent = "Evaluating with Claude…";
   } else if (msg.phase === "done") {

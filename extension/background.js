@@ -117,7 +117,7 @@ let scrapeWorkerRunning = false;
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "evaluate") {
-    handleEvaluate(msg.listingIds, sender.tab.id)
+    handleEvaluate(msg.listingIds, sender.tab.id, msg.options || {})
       .then(sendResponse)
       .catch((e) => sendResponse({ error: e.message }));
     return true; // async response
@@ -276,7 +276,9 @@ async function checkHelperHealth() {
   }
 }
 
-async function handleEvaluate(listingIds, sourceTabId) {
+async function handleEvaluate(listingIds, sourceTabId, options = {}) {
+  const includeImages = !!options.includeImages;
+
   // Fail-fast: a 40-second scrape phase is wasted effort if the helper
   // isn't running. Confirm reachability before we open any tabs.
   const helperUp = await checkHelperHealth();
@@ -382,10 +384,40 @@ async function handleEvaluate(listingIds, sourceTabId) {
     }
   }
 
+  // Image fetch phase. Only runs on the explicit re-analyze opt-in path. Any
+  // failure aborts the whole evaluate — per the agreed decision, we don't
+  // want to silently degrade to text-only when the user explicitly asked for
+  // a photo-aware analysis.
+  if (includeImages && valid.length) {
+    sendProgress(sourceTabId, { phase: "images" });
+    try {
+      for (const v of valid) {
+        const urls = (v.images || []).map((i) => i.url);
+        if (urls.length === 0) {
+          throw new Error(
+            "No photos detected on this listing. Re-analyze without 'Include photos' to proceed."
+          );
+        }
+        v.images_b64 = await fetchImagesAsBase64(v.id, urls);
+      }
+    } catch (e) {
+      console.error("[mw] image fetch failed:", e.message);
+      mwLog("image_fetch_aborted", "error", { error: e.message });
+      sendProgress(sourceTabId, { phase: "error", error: e.message });
+      return { error: e.message };
+    }
+  }
+
   let verdicts = [];
   if (valid.length) {
     sendProgress(sourceTabId, { phase: "evaluating" });
-    console.log("[mw] sending to helper:", valid.map(v => ({id: v.id, title: v.title, price: v.price, hasContext: !!v.user_context})));
+    console.log("[mw] sending to helper:", valid.map(v => ({
+      id: v.id,
+      title: v.title,
+      price: v.price,
+      hasContext: !!v.user_context,
+      imageCount: v.images_b64 ? v.images_b64.length : 0,
+    })));
     try {
       verdicts = await postEvaluateWithRetry({ listings: valid });
       console.log("[mw] verdicts:", verdicts);
@@ -399,6 +431,7 @@ async function handleEvaluate(listingIds, sourceTabId) {
   const updates = {};
   for (const v of verdicts) {
     const item = valid.find((s) => s.id === v.id);
+    const imgCount = item?.images_b64 ? item.images_b64.length : 0;
     updates[`verdict:${v.id}`] = {
       ...v,
       title: item?.title,
@@ -410,6 +443,8 @@ async function handleEvaluate(listingIds, sourceTabId) {
       drive_time_one_way_min: item?.drive_time_one_way_min,
       round_trip_gas_cost: item?.round_trip_gas_cost,
       round_trip_time_cost: item?.round_trip_time_cost,
+      images_included: imgCount > 0,
+      image_count: imgCount,
       evaluatedAt: Date.now(),
     };
   }
@@ -513,6 +548,68 @@ function sleep(ms) {
 setInterval(() => {
   chrome.runtime.getPlatformInfo().catch(() => {});
 }, 20000);
+
+// --- Image fetch --------------------------------------------------------
+//
+// Re-analyze with "Include photos" downloads each image URL the listing
+// scraper found and encodes it as base64 for transport to the helper. We
+// validate content-type and cap per-image bytes; any failure aborts the
+// whole evaluate (the user opted in expecting photo-aware analysis, not
+// silent text-only fallback).
+
+const IMAGE_MAX_BYTES = 2 * 1024 * 1024;
+
+async function fetchImagesAsBase64(listingId, urls) {
+  const out = [];
+  for (let i = 0; i < urls.length; i++) {
+    const url = urls[i];
+    const t0 = Date.now();
+    let resp;
+    try {
+      // No explicit Referer — fbcdn.net mostly serves images publicly. If we
+      // start seeing 403s, add `headers: {Referer: "https://www.facebook.com/"}`.
+      resp = await fetch(url);
+    } catch (e) {
+      throw new Error(`image fetch failed (${i + 1}/${urls.length}): ${e.message}`);
+    }
+    if (!resp.ok) {
+      throw new Error(`image fetch ${resp.status} (${i + 1}/${urls.length})`);
+    }
+    const contentType = (resp.headers.get("content-type") || "").toLowerCase();
+    if (!contentType.startsWith("image/")) {
+      throw new Error(`image ${i + 1} returned non-image content-type: ${contentType}`);
+    }
+    const blob = await resp.blob();
+    if (blob.size > IMAGE_MAX_BYTES) {
+      throw new Error(
+        `image ${i + 1} too large: ${blob.size} bytes (cap ${IMAGE_MAX_BYTES})`
+      );
+    }
+    const b64 = await blobToBase64(blob);
+    out.push({ b64, mime: blob.type || contentType, bytes: blob.size });
+    mwLog("image_fetched", "info", {
+      listingId,
+      index: i,
+      bytes: blob.size,
+      mime: blob.type,
+      elapsedMs: Date.now() - t0,
+    });
+  }
+  return out;
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = reader.result;
+      const comma = dataUrl.indexOf(",");
+      resolve(comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl);
+    };
+    reader.onerror = () => reject(reader.error || new Error("FileReader failed"));
+    reader.readAsDataURL(blob);
+  });
+}
 
 // --- Geocoding & trip-cost helpers --------------------------------------
 

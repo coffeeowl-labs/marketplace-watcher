@@ -386,7 +386,78 @@ function tryScrape() {
   );
   const location = locMatch ? locMatch[0] : "";
 
-  return { title, price, location, description };
+  const images = scrapeImages(main);
+
+  return { title, price, location, description, images };
+}
+
+const IMAGE_CAP = 5;
+const PREFERRED_MAX_WIDTH = 1024;
+
+// FB Marketplace renders the photo carousel as <img> tags inside [role=main].
+// Each img typically has a srcset with multiple resolutions. We pick the
+// largest variant <= 1024px wide (good condition-assessment fidelity, bounded
+// payload), dedupe by hostname+pathname (FB serves the same hash at multiple
+// sizes; pathname identifies the underlying image), drop non-fbcdn hosts and
+// tiny avatars, and cap at the first 5 in DOM order.
+function scrapeImages(main) {
+  const seenPaths = new Set();
+  const out = [];
+  for (const img of main.querySelectorAll("img")) {
+    if (out.length >= IMAGE_CAP) break;
+    const picked = pickFromSrcset(img);
+    if (!picked) continue;
+    let parsed;
+    try {
+      parsed = new URL(picked.url, location.href);
+    } catch {
+      continue;
+    }
+    if (!parsed.hostname.endsWith(".fbcdn.net")) continue;
+    // Skip tiny avatars/icons. naturalWidth only reliable if loaded; treat 0
+    // as unknown and fall back to the picked srcset width.
+    const widthHint = img.naturalWidth || picked.width || 0;
+    if (widthHint && widthHint < 300) continue;
+    const dedupeKey = `${parsed.hostname}${parsed.pathname}`;
+    if (seenPaths.has(dedupeKey)) continue;
+    seenPaths.add(dedupeKey);
+    out.push({ url: parsed.href, width: picked.width || null });
+  }
+  mwLog("scrape_images", "debug", { count: out.length });
+  return out;
+}
+
+function pickFromSrcset(img) {
+  const srcset = img.getAttribute("srcset");
+  const candidates = [];
+  if (srcset) {
+    for (const entry of srcset.split(",")) {
+      const parts = entry.trim().split(/\s+/);
+      if (!parts[0]) continue;
+      const url = parts[0];
+      const desc = parts[1] || "";
+      const m = desc.match(/^(\d+)w$/);
+      const width = m ? parseInt(m[1], 10) : null;
+      candidates.push({ url, width });
+    }
+  }
+  // Pick the largest candidate with width <= PREFERRED_MAX_WIDTH; if all
+  // entries are larger, take the smallest (still better than nothing).
+  // If no widths are known, take the first.
+  const withWidths = candidates.filter((c) => c.width != null);
+  if (withWidths.length) {
+    const eligible = withWidths.filter((c) => c.width <= PREFERRED_MAX_WIDTH);
+    if (eligible.length) {
+      eligible.sort((a, b) => b.width - a.width);
+      return eligible[0];
+    }
+    withWidths.sort((a, b) => a.width - b.width);
+    return withWidths[0];
+  }
+  if (candidates.length) return candidates[0];
+  const src = img.getAttribute("src");
+  if (src) return { url: src, width: null };
+  return null;
 }
 
 function sleep(ms) {

@@ -169,6 +169,31 @@
   border-color: #1877f2;
 }
 
+.mw-modal-image-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  padding: 4px 0;
+  font-size: 13px;
+  color: #ddd;
+  user-select: none;
+}
+.mw-modal-image-row input[type="checkbox"] {
+  cursor: pointer;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  flex-shrink: 0;
+}
+.mw-modal-image-row.mw-disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.mw-modal-image-row.mw-disabled input[type="checkbox"] {
+  cursor: not-allowed;
+}
+
 .mw-modal-buttons {
   display: flex;
   justify-content: flex-end;
