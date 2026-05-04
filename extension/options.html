@@ -1,0 +1,43 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Marketplace Watcher Settings</title>
+    <style>
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+        background: #1a1a1a;
+        color: #eee;
+        padding: 20px;
+        min-width: 380px;
+      }
+      h1 { font-size: 16px; margin: 0 0 16px 0; }
+      .row { display: flex; align-items: flex-start; gap: 10px; padding: 8px 0; }
+      .row input[type="checkbox"] { margin-top: 3px; width: 16px; height: 16px; }
+      .row label { flex: 1; cursor: pointer; }
+      .hint { font-size: 12px; color: #999; line-height: 1.4; margin-top: 4px; }
+      .status { font-size: 12px; color: #4caf50; margin-top: 12px; min-height: 16px; }
+      code { background: #2a2a2a; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <h1>Marketplace Watcher Settings</h1>
+
+    <div class="row">
+      <input type="checkbox" id="debug_logging" />
+      <label for="debug_logging">
+        <div><b>Debug logging</b></div>
+        <div class="hint">
+          Send detailed events (scrape internals, helper calls, cache hits) to
+          the local helper for troubleshooting. Logs are appended to
+          <code>~/.local/state/marketplace_watcher/events.jsonl</code>.
+          Errors and warnings are always logged regardless of this setting.
+        </div>
+      </label>
+    </div>
+
+    <div class="status" id="status"></div>
+
+    <script src="options.js"></script>
+  </body>
+</html>

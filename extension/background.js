@@ -10,7 +10,81 @@
 
 const HELPER_URL = "http://127.0.0.1:8787/evaluate";
 const HELPER_HEALTH_URL = "http://127.0.0.1:8787/health";
+const HELPER_LOG_URL = "http://127.0.0.1:8787/log";
 const HELPER_HEALTH_TIMEOUT_MS = 2000;
+
+// --- Logging --------------------------------------------------------------
+// mwLog buffers entries and flushes them to the helper's /log endpoint.
+// Errors and warnings always flow through; debug-level entries are gated by
+// the `debug_logging` setting (configurable in the options page, default ON).
+// Logging failures are silently dropped — never block real work.
+const LOG_FLUSH_MS = 1000;
+const LOG_BATCH_MAX = 50;
+const LOG_BUFFER = [];
+let DEBUG_LOGGING = false;
+let SESSION_ID = `bg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+chrome.storage.local.get("debug_logging").then(({ debug_logging }) => {
+  if (debug_logging !== undefined) DEBUG_LOGGING = !!debug_logging;
+  mwLog("session_start", "info", { sessionId: SESSION_ID });
+});
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes.debug_logging) {
+    DEBUG_LOGGING = !!changes.debug_logging.newValue;
+  }
+});
+
+function mwLog(category, level, data = {}) {
+  enqueueLogEntry({
+    ts: Date.now(),
+    src: "background",
+    sessionId: SESSION_ID,
+    category,
+    level: level || "debug",
+    ...data,
+  });
+}
+
+// Cap on the dedupe set so we don't grow it forever. Entries older than this
+// many recent IDs may be re-recorded — fine, since the duplicates window is
+// narrow (the lifetime of a single scrape).
+const LOG_DEDUPE_CAP = 5000;
+const LOG_SEEN_IDS = new Set();
+const LOG_SEEN_ORDER = [];
+
+function enqueueLogEntry(entry) {
+  const lvl = entry.level || "debug";
+  // Errors and warns are always recorded. Everything else (info/debug) is
+  // gated behind the debug toggle.
+  if (lvl !== "error" && lvl !== "warn" && !DEBUG_LOGGING) return;
+  if (entry.entryId) {
+    if (LOG_SEEN_IDS.has(entry.entryId)) return;
+    LOG_SEEN_IDS.add(entry.entryId);
+    LOG_SEEN_ORDER.push(entry.entryId);
+    if (LOG_SEEN_ORDER.length > LOG_DEDUPE_CAP) {
+      const evict = LOG_SEEN_ORDER.shift();
+      LOG_SEEN_IDS.delete(evict);
+    }
+  }
+  LOG_BUFFER.push(entry);
+  if (LOG_BUFFER.length >= LOG_BATCH_MAX) flushLogs();
+}
+
+async function flushLogs() {
+  if (LOG_BUFFER.length === 0) return;
+  const batch = LOG_BUFFER.splice(0, LOG_BUFFER.length);
+  try {
+    await fetch(HELPER_LOG_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ entries: batch }),
+    });
+  } catch (e) {
+    // Helper may be down — don't requeue (would grow unboundedly). Drop.
+  }
+}
+
+setInterval(flushLogs, LOG_FLUSH_MS);
 const TAB_OPEN_DELAY_MS = 2000;
 // Scrape timer budget begins AFTER the tab signals "complete", so slow
 // first-tab page loads don't eat into the scraping window. The load
@@ -55,8 +129,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return false;
   }
   if (msg.type === "scraped") {
+    // Embedded diagnostics from the listing tab — backup path in case the
+    // tab was closed before its own runtime.sendMessage relays flushed.
+    // We dedupe via the entry timestamp + category so re-receiving via the
+    // direct relay path doesn't double-write.
+    if (Array.isArray(msg.diagnostics)) {
+      for (const e of msg.diagnostics) {
+        e.viaScrapedBackup = true;
+        enqueueLogEntry(e);
+      }
+    }
     const pending = pendingScrapes.get(msg.listingId);
     if (pending) pending.resolve(msg.data);
+    sendResponse({ ok: true });
+    return false;
+  }
+  if (msg.type === "log") {
+    // Embedded diagnostics from content-script scrape attempts. We trust the
+    // entry's own level field so a content-script error gets through even if
+    // debug is off.
+    if (msg.entry) enqueueLogEntry(msg.entry);
+    if (Array.isArray(msg.entries)) for (const e of msg.entries) enqueueLogEntry(e);
     sendResponse({ ok: true });
     return false;
   }
@@ -110,6 +203,66 @@ async function startScrapeWorker() {
   scrapeWorkerRunning = false;
 }
 
+// Firefox MV3's background event page can drop a long-running fetch even
+// with the keepalive (see setInterval below). The helper caches verdicts
+// by request-hash for 5 minutes, so retrying the same body is free — it
+// either returns cached results or joins the still-running computation
+// instead of starting a fresh Claude call.
+async function postEvaluateWithRetry(payload, maxAttempts = 2) {
+  const body = JSON.stringify(payload);
+  const traceId = `eval-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const ids = (payload.listings || []).map((l) => l.id);
+  mwLog("helper_call_start", "info", {
+    traceId,
+    attempts: maxAttempts,
+    listingIds: ids,
+    bodyChars: body.length,
+  });
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const t0 = Date.now();
+    try {
+      const resp = await fetch(HELPER_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+      });
+      const elapsedMs = Date.now() - t0;
+      if (!resp.ok) {
+        const text = await resp.text();
+        // 5xx might be transient; 4xx won't get better with a retry.
+        if (resp.status >= 500 && attempt < maxAttempts) {
+          lastErr = new Error(`helper ${resp.status}: ${text.slice(0, 200)}`);
+          console.warn(`[mw] helper ${resp.status}, retrying (attempt ${attempt + 1}/${maxAttempts})`);
+          mwLog("helper_call_retry", "warn", { traceId, attempt, status: resp.status, elapsedMs, body: text.slice(0, 500) });
+          await sleep(2000);
+          continue;
+        }
+        mwLog("helper_call_end", "error", { traceId, attempt, status: resp.status, elapsedMs, body: text.slice(0, 500) });
+        throw new Error(`helper ${resp.status}: ${text.slice(0, 200)}`);
+      }
+      const json = await resp.json();
+      mwLog("helper_call_end", "info", {
+        traceId, attempt, elapsedMs, status: 200,
+        verdicts: json.verdicts || [],
+      });
+      return json.verdicts || [];
+    } catch (e) {
+      const elapsedMs = Date.now() - t0;
+      lastErr = e;
+      if (attempt < maxAttempts) {
+        console.warn(`[mw] helper fetch failed (${e.message}), retrying (attempt ${attempt + 1}/${maxAttempts})`);
+        mwLog("helper_call_retry", "warn", { traceId, attempt, elapsedMs, error: e.message });
+        await sleep(2000);
+        continue;
+      }
+      mwLog("helper_call_end", "error", { traceId, attempt, elapsedMs, error: e.message });
+      throw e;
+    }
+  }
+  throw lastErr;
+}
+
 async function checkHelperHealth() {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), HELPER_HEALTH_TIMEOUT_MS);
@@ -145,6 +298,11 @@ async function handleEvaluate(listingIds, sourceTabId) {
   });
 
   console.log("[mw] evaluate request", { listingIds, cached: listingIds.length - uncachedIds.length, uncached: uncachedIds.length });
+  mwLog("evaluate_request", "info", {
+    listingIds,
+    cachedCount: listingIds.length - uncachedIds.length,
+    uncachedIds,
+  });
 
   // Queue all scrapes through the shared enqueueScrape — this dedupes
   // against any already-running eager prefetch and uses the storage cache
@@ -171,9 +329,30 @@ async function handleEvaluate(listingIds, sourceTabId) {
           price: data.price,
           location: data.location,
           descChars: (data.description || "").length,
+          descSnippet: (data.description || "").slice(0, 120),
           distance_miles: data.distance_miles,
         });
-        return { id, ...data };
+        mwLog("scrape_ready", "info", {
+          listingId: id,
+          title: data.title,
+          price: data.price,
+          location: data.location,
+          descChars: (data.description || "").length,
+          descSnippet: (data.description || "").slice(0, 200),
+          distance_miles: data.distance_miles,
+        });
+        const result = { id, ...data };
+        // Empty description = structural scrape failed. Don't ship the
+        // listing to Claude with no body — that produces a verdict based
+        // only on title/price and silently hides the scrape failure from
+        // the user. Mark it as an error so the search page renders an
+        // ERR badge they can act on (re-analyze later, or open the
+        // listing to verify FB's markup).
+        if (!data.description || !data.description.trim()) {
+          result.error = "No description detected on listing page";
+          mwLog("scrape_no_description", "warn", { listingId: id, title: data.title, price: data.price });
+        }
+        return result;
       } catch (e) {
         done += 1;
         sendProgress(sourceTabId, {
@@ -182,28 +361,33 @@ async function handleEvaluate(listingIds, sourceTabId) {
           done,
         });
         console.warn(`[mw] scrape failed ${id}:`, e.message);
+        mwLog("scrape_failed", "error", { listingId: id, error: e.message });
         return { id, error: e.message };
       }
     })
   );
 
   const valid = scraped.filter((s) => !s.error);
+
+  // Attach any user-provided context notes. These are first-party
+  // observations (typically from photos) the user wants the model to weigh
+  // alongside the scraped description. Persisted under `context:{id}` and
+  // not cleared on re-analysis, so they carry forward across runs.
+  if (valid.length) {
+    const ctxKeys = valid.map((v) => `context:${v.id}`);
+    const ctxStore = await chrome.storage.local.get(ctxKeys);
+    for (const v of valid) {
+      const note = ctxStore[`context:${v.id}`];
+      if (note) v.user_context = note;
+    }
+  }
+
   let verdicts = [];
   if (valid.length) {
     sendProgress(sourceTabId, { phase: "evaluating" });
-    console.log("[mw] sending to helper:", valid.map(v => ({id: v.id, title: v.title, price: v.price})));
+    console.log("[mw] sending to helper:", valid.map(v => ({id: v.id, title: v.title, price: v.price, hasContext: !!v.user_context})));
     try {
-      const resp = await fetch(HELPER_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ listings: valid }),
-      });
-      if (!resp.ok) {
-        const text = await resp.text();
-        throw new Error(`helper ${resp.status}: ${text.slice(0, 200)}`);
-      }
-      const json = await resp.json();
-      verdicts = json.verdicts || [];
+      verdicts = await postEvaluateWithRetry({ listings: valid });
       console.log("[mw] verdicts:", verdicts);
     } catch (e) {
       console.error("[mw] helper error:", e.message);
@@ -221,10 +405,27 @@ async function handleEvaluate(listingIds, sourceTabId) {
       price: item?.price,
       location: item?.location,
       description: item?.description, // store so user can verify what was evaluated
+      user_context: item?.user_context,
       distance_miles: item?.distance_miles,
       drive_time_one_way_min: item?.drive_time_one_way_min,
       round_trip_gas_cost: item?.round_trip_gas_cost,
       round_trip_time_cost: item?.round_trip_time_cost,
+      evaluatedAt: Date.now(),
+    };
+  }
+  // Persist scrape-side failures (no description, scrape timeout, etc.) too,
+  // so the ERR badge survives page reloads instead of going back to an
+  // empty checkbox. Re-analyzing a listing busts the cache, so this is
+  // sticky-but-recoverable.
+  for (const s of scraped) {
+    if (!s.error) continue;
+    updates[`verdict:${s.id}`] = {
+      id: s.id,
+      error: s.error,
+      title: s.title,
+      price: s.price,
+      location: s.location,
+      description: s.description,
       evaluatedAt: Date.now(),
     };
   }

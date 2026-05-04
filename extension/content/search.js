@@ -7,6 +7,7 @@ const SOFT_FLOOR = 5;
 
 const selectedIds = new Set();
 let cachedVerdicts = {}; // id -> verdict object
+let cachedContexts = {}; // id -> user-provided context string
 let mutationDebounceTimer = null;
 
 // Display order of filter rows in the popover.
@@ -15,6 +16,7 @@ const FILTER_KINDS = [
   { key: "good", label: "Good" },
   { key: "fair", label: "Fair" },
   { key: "skip", label: "Skip" },
+  { key: "error", label: "Error" },
   { key: "unanalyzed", label: "Unanalyzed" },
   { key: "sponsored", label: "Sponsored / Ads" },
 ];
@@ -26,12 +28,13 @@ const filterState = {
   good: true,
   fair: true,
   skip: true,
+  error: true,
   unanalyzed: true,
   sponsored: false,
 };
 
 (async () => {
-  cachedVerdicts = await loadCachedVerdicts();
+  ({ verdicts: cachedVerdicts, contexts: cachedContexts } = await loadCachedData());
   ensureFAB();
   await loadFilterState();
   setupObserver();
@@ -113,13 +116,15 @@ function toggleFilterPopover(force) {
   pop.classList.toggle("mw-open", open);
 }
 
-async function loadCachedVerdicts() {
+async function loadCachedData() {
   const all = await chrome.storage.local.get(null);
-  const out = {};
+  const verdicts = {};
+  const contexts = {};
   for (const [k, v] of Object.entries(all)) {
-    if (k.startsWith("verdict:")) out[k.slice("verdict:".length)] = v;
+    if (k.startsWith("verdict:")) verdicts[k.slice("verdict:".length)] = v;
+    else if (k.startsWith("context:")) contexts[k.slice("context:".length)] = v;
   }
-  return out;
+  return { verdicts, contexts };
 }
 
 function setupObserver() {
@@ -127,10 +132,34 @@ function setupObserver() {
     clearTimeout(mutationDebounceTimer);
     mutationDebounceTimer = setTimeout(attachOverlays, 200);
   });
-  observer.observe(document.body, { childList: true, subtree: true });
+  // We need attribute observation (filtered to href) because FB sometimes
+  // recycles a card wrapper by mutating only the link's href in place —
+  // childList alone misses that and the badge ends up pinned to the wrong
+  // listing. The filter keeps the observer from firing on every unrelated
+  // attribute change.
+  observer.observe(document.body, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ["href"],
+  });
 }
 
 function attachOverlays() {
+  // Validation sweep: confirm each marked card still hosts a link pointing
+  // at the same listing it was marked for. FB's virtualizer can swap a
+  // wrapper's contents (or the link's href in place) in ways our observer
+  // doesn't always catch in time, leaving a stale badge pinned to an
+  // unrelated card. Scrub any mismatches before re-attaching below.
+  for (const el of document.querySelectorAll("[data-mw-card]")) {
+    const inner = el.querySelector('a[href*="/marketplace/item/"]');
+    const innerId = inner ? extractListingId(inner.getAttribute("href") || "") : null;
+    if (innerId !== el.dataset.mwCard) {
+      el.removeAttribute("data-mw-card");
+      el.querySelectorAll(".mw-checkbox, .mw-badge").forEach((n) => n.remove());
+    }
+  }
+
   const links = document.querySelectorAll('a[href*="/marketplace/item/"]');
   for (const link of links) {
     const id = extractListingId(link.getAttribute("href") || "");
@@ -142,8 +171,17 @@ function attachOverlays() {
     // already block-level, so we can set position:relative without touching
     // FB's own layout properties on the link.
     const card = link.parentElement || link;
-    if (card.dataset.mwCard === "1") continue;
-    card.dataset.mwCard = "1";
+
+    // FB virtualizes its scroll list — it swaps a card wrapper's contents
+    // for a different listing without removing the wrapper itself. We bind
+    // the marker to the listing ID (not a boolean) so we detect that the
+    // wrapper now hosts a different listing and rebuild the overlay
+    // instead of leaving a stale badge pinned to an unrelated card.
+    if (card.dataset.mwCard === id) continue;
+    if (card.dataset.mwCard) {
+      card.querySelectorAll(".mw-checkbox, .mw-badge").forEach((n) => n.remove());
+    }
+    card.dataset.mwCard = id;
 
     const cs = getComputedStyle(card);
     if (cs.position === "static") card.style.position = "relative";
@@ -242,10 +280,11 @@ function attachBadge(card, verdict) {
   const v = verdict.verdict || "error";
   badge.className = `mw-badge mw-${v}`;
   badge.textContent = (verdict.error ? "ERR" : v).toUpperCase();
+  if (cachedContexts[verdict.id]) badge.classList.add("mw-has-context");
   badge.addEventListener("contextmenu", (e) => {
     e.preventDefault();
     e.stopPropagation();
-    onReEvaluateBadge(verdict.id);
+    openContextPopup(verdict.id);
   });
   // Tooltip surfaces the full scraped payload alongside the verdict so
   // we can sanity-check what the model actually saw.
@@ -270,7 +309,9 @@ function attachBadge(card, verdict) {
     const d = verdict.description;
     lines.push(`\nDescription (${d.length} chars):\n${d.slice(0, 600)}${d.length > 600 ? "…" : ""}`);
   }
-  lines.push("\n(right-click to re-evaluate)");
+  const ctx = cachedContexts[verdict.id];
+  if (ctx) lines.push(`\nUser notes:\n${ctx}`);
+  lines.push("\n(right-click to add context / re-evaluate)");
   badge.title = lines.join("\n");
   card.appendChild(badge);
 }
@@ -379,6 +420,7 @@ async function onClearCacheClick() {
   if (!confirm(`Clear ${count} cached verdict${count === 1 ? "" : "s"}?`)) return;
   await chrome.storage.local.clear();
   cachedVerdicts = {};
+  cachedContexts = {};
   selectedIds.clear();
   refreshAllOverlays();
   updateFAB();
@@ -405,14 +447,11 @@ function flashFAB(text) {
   }, 1500);
 }
 
-async function onReEvaluateBadge(id) {
-  const v = cachedVerdicts[id];
-  const label = v?.title ? `"${v.title}"` : id;
-  if (!confirm(`Re-evaluate ${label}?`)) return;
-
+async function reEvaluateListing(id) {
   delete cachedVerdicts[id];
   // Drop both verdict and scraped cache so re-evaluation does a fresh
-  // scrape — listing prices and descriptions can change.
+  // scrape — listing prices and descriptions can change. We deliberately
+  // keep `context:{id}` so the user note carries forward into the new run.
   await chrome.storage.local.remove([`verdict:${id}`, `scraped:${id}`]);
 
   await ensureUserLocation();
@@ -440,6 +479,121 @@ async function onReEvaluateBadge(id) {
     fab.textContent = `Error: ${e.message}`;
     setTimeout(updateFAB, 5000);
   }
+}
+
+// Right-click on a verdict badge opens this modal so the user can attach
+// context (e.g. "rusty, kept outside") that will be appended to the
+// description on the next analysis. Notes persist across re-analyses
+// until cleared explicitly.
+function openContextPopup(id) {
+  // Don't stack popups.
+  if (document.getElementById("mw-modal-backdrop")) return;
+
+  const verdict = cachedVerdicts[id];
+  const existing = cachedContexts[id] || "";
+
+  const backdrop = document.createElement("div");
+  backdrop.id = "mw-modal-backdrop";
+
+  const modal = document.createElement("div");
+  modal.id = "mw-modal";
+  backdrop.appendChild(modal);
+
+  const title = document.createElement("div");
+  title.className = "mw-modal-title";
+  title.textContent = "Add context";
+  modal.appendChild(title);
+
+  if (verdict?.title) {
+    const sub = document.createElement("div");
+    sub.className = "mw-modal-sub";
+    sub.textContent = verdict.title;
+    modal.appendChild(sub);
+  }
+
+  const hint = document.createElement("div");
+  hint.className = "mw-modal-hint";
+  hint.textContent =
+    "Notes you add here are prepended to the listing description on re-analysis. Useful for visual cues from photos (e.g. \"rust on frame\", \"missing pedal\").";
+  modal.appendChild(hint);
+
+  const ta = document.createElement("textarea");
+  ta.className = "mw-modal-textarea";
+  ta.rows = 5;
+  ta.value = existing;
+  ta.placeholder = "e.g. bike looks rusty, probably kept outside in the rain";
+  modal.appendChild(ta);
+
+  const buttons = document.createElement("div");
+  buttons.className = "mw-modal-buttons";
+  modal.appendChild(buttons);
+
+  const close = () => {
+    backdrop.remove();
+    document.removeEventListener("keydown", onKey);
+  };
+
+  const saveOnly = async () => {
+    const next = ta.value.trim();
+    if (next) {
+      await chrome.storage.local.set({ [`context:${id}`]: next });
+      cachedContexts[id] = next;
+    } else if (existing) {
+      await chrome.storage.local.remove(`context:${id}`);
+      delete cachedContexts[id];
+    }
+    refreshAllOverlays();
+  };
+
+  const mkBtn = (label, cls, onClick) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = `mw-modal-btn ${cls}`;
+    b.textContent = label;
+    b.addEventListener("click", onClick);
+    buttons.appendChild(b);
+    return b;
+  };
+
+  mkBtn("Cancel", "mw-modal-cancel", close);
+
+  if (existing) {
+    mkBtn("Clear", "mw-modal-clear", async () => {
+      await chrome.storage.local.remove(`context:${id}`);
+      delete cachedContexts[id];
+      refreshAllOverlays();
+      close();
+    });
+  }
+
+  mkBtn("Save", "mw-modal-save", async () => {
+    await saveOnly();
+    close();
+  });
+
+  mkBtn("Save & Re-analyze", "mw-modal-primary", async () => {
+    await saveOnly();
+    close();
+    reEvaluateListing(id);
+  });
+
+  // Backdrop click closes; clicks inside the modal don't bubble.
+  backdrop.addEventListener("click", (e) => {
+    if (e.target === backdrop) close();
+  });
+  modal.addEventListener("click", (e) => e.stopPropagation());
+
+  const onKey = (e) => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      close();
+    }
+  };
+  document.addEventListener("keydown", onKey);
+
+  document.body.appendChild(backdrop);
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
 }
 
 async function onEvaluateClick() {
@@ -477,7 +631,7 @@ async function onEvaluateClick() {
 }
 
 function refreshAllOverlays() {
-  document.querySelectorAll('[data-mw-card="1"]').forEach((el) => {
+  document.querySelectorAll("[data-mw-card]").forEach((el) => {
     el.removeAttribute("data-mw-card");
     el.querySelectorAll(".mw-checkbox, .mw-badge").forEach((n) => n.remove());
   });
