@@ -8,24 +8,27 @@
 //   3. POST scraped batch to local helper, get verdicts
 //   4. Persist new verdicts to storage and return full set to the search page
 
-const HELPER_URL = "http://127.0.0.1:8787/evaluate";
-const HELPER_HEALTH_URL = "http://127.0.0.1:8787/health";
-const HELPER_LOG_URL = "http://127.0.0.1:8787/log";
-const HELPER_HEALTH_TIMEOUT_MS = 2000;
-
 // --- Logging --------------------------------------------------------------
-// mwLog buffers entries and flushes them to the helper's /log endpoint.
-// Errors and warnings always flow through; debug-level entries are gated by
-// the `debug_logging` setting (configurable in the options page, default ON).
-// Logging failures are silently dropped — never block real work.
-const LOG_FLUSH_MS = 1000;
-const LOG_BATCH_MAX = 50;
-const LOG_BUFFER = [];
-let DEBUG_LOGGING = false;
-let SESSION_ID = `bg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+// mwLog buffers entries into a session-scoped ring buffer; entries drain
+// either by piggybacking on the next outgoing native-messaging request (the
+// common path) or via a one-shot log_flush port (backstop when buffer hits
+// LOG_BACKSTOP_MAX or the buffer is non-empty for >LOG_BACKSTOP_MAX_AGE_MS).
+// Errors and warns always flow through; everything else is gated by the
+// `debug_logging` setting (default ON). Logging failures are dropped.
+const LOG_BUFFER_KEY = "mw_log_buf";
+const LOG_SEQ_KEY = "mw_log_seq";
+const LOG_BUFFER_MAX = 1000;
+const LOG_BACKSTOP_MAX = 200;
+const LOG_BACKSTOP_MAX_AGE_MS = 5 * 60 * 1000;
+const LOG_DEDUPE_CAP = 5000;
+const LOG_SEEN_IDS = new Set();
+const LOG_SEEN_ORDER = [];
+let LOG_LAST_FLUSH_AT = Date.now();
+let DEBUG_LOGGING = true;
+const SESSION_ID = `bg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
 chrome.storage.local.get("debug_logging").then(({ debug_logging }) => {
-  if (debug_logging !== undefined) DEBUG_LOGGING = !!debug_logging;
+  DEBUG_LOGGING = debug_logging === undefined ? true : !!debug_logging;
   mwLog("session_start", "info", { sessionId: SESSION_ID });
 });
 chrome.storage.onChanged.addListener((changes, area) => {
@@ -45,17 +48,8 @@ function mwLog(category, level, data = {}) {
   });
 }
 
-// Cap on the dedupe set so we don't grow it forever. Entries older than this
-// many recent IDs may be re-recorded — fine, since the duplicates window is
-// narrow (the lifetime of a single scrape).
-const LOG_DEDUPE_CAP = 5000;
-const LOG_SEEN_IDS = new Set();
-const LOG_SEEN_ORDER = [];
-
 function enqueueLogEntry(entry) {
   const lvl = entry.level || "debug";
-  // Errors and warns are always recorded. Everything else (info/debug) is
-  // gated behind the debug toggle.
   if (lvl !== "error" && lvl !== "warn" && !DEBUG_LOGGING) return;
   if (entry.entryId) {
     if (LOG_SEEN_IDS.has(entry.entryId)) return;
@@ -66,25 +60,66 @@ function enqueueLogEntry(entry) {
       LOG_SEEN_IDS.delete(evict);
     }
   }
-  LOG_BUFFER.push(entry);
-  if (LOG_BUFFER.length >= LOG_BATCH_MAX) flushLogs();
+  // Fire-and-forget storage write; the lock keeps writers serial.
+  appendToLogBuffer(entry).catch(() => {});
 }
 
-async function flushLogs() {
-  if (LOG_BUFFER.length === 0) return;
-  const batch = LOG_BUFFER.splice(0, LOG_BUFFER.length);
-  try {
-    await fetch(HELPER_LOG_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ entries: batch }),
+async function appendToLogBuffer(entry) {
+  await navigator.locks.request("mw-log-drain", async () => {
+    const data = await chrome.storage.session.get([LOG_BUFFER_KEY, LOG_SEQ_KEY]);
+    const seq = (data[LOG_SEQ_KEY] || 0) + 1;
+    const buf = data[LOG_BUFFER_KEY] || [];
+    entry.seq = seq;
+    entry.session_id = SESSION_ID;
+    buf.push(entry);
+    while (buf.length > LOG_BUFFER_MAX) buf.shift();
+    await chrome.storage.session.set({
+      [LOG_BUFFER_KEY]: buf,
+      [LOG_SEQ_KEY]: seq,
     });
-  } catch (e) {
-    // Helper may be down — don't requeue (would grow unboundedly). Drop.
+  });
+  maybeBackstopFlush().catch(() => {});
+}
+
+async function consumeLogBuffer() {
+  return navigator.locks.request("mw-log-drain", async () => {
+    const data = await chrome.storage.session.get(LOG_BUFFER_KEY);
+    const buf = data[LOG_BUFFER_KEY] || [];
+    if (buf.length === 0) return [];
+    await chrome.storage.session.set({ [LOG_BUFFER_KEY]: [] });
+    LOG_LAST_FLUSH_AT = Date.now();
+    return buf;
+  });
+}
+
+async function peekLogBufferSize() {
+  const data = await chrome.storage.session.get(LOG_BUFFER_KEY);
+  return (data[LOG_BUFFER_KEY] || []).length;
+}
+
+let backstopFlushScheduled = false;
+
+async function maybeBackstopFlush() {
+  if (backstopFlushScheduled) return;
+  const size = await peekLogBufferSize();
+  if (size === 0) return;
+  const sinceFlush = Date.now() - LOG_LAST_FLUSH_AT;
+  if (size < LOG_BACKSTOP_MAX && sinceFlush < LOG_BACKSTOP_MAX_AGE_MS) return;
+  backstopFlushScheduled = true;
+  try {
+    const logs = await consumeLogBuffer();
+    if (logs.length) await flushLogsOneShot(logs);
+  } catch (_) {
+    // Drop on failure — the old fetch-fail behavior. Logs are best-effort.
+  } finally {
+    backstopFlushScheduled = false;
   }
 }
 
-setInterval(flushLogs, LOG_FLUSH_MS);
+// Periodic check for the age-based backstop. Cheap; only spawns a host
+// process if the buffer is non-empty AND stale. setInterval may pause when
+// the event page suspends — fine; the next outgoing message will drain.
+setInterval(() => { maybeBackstopFlush().catch(() => {}); }, 60 * 1000);
 const TAB_OPEN_DELAY_MS = 2000;
 // Scrape timer budget begins AFTER the tab signals "complete", so slow
 // first-tab page loads don't eat into the scraping window. The load
@@ -203,87 +238,69 @@ async function startScrapeWorker() {
   scrapeWorkerRunning = false;
 }
 
-// Firefox MV3's background event page can drop a long-running fetch even
-// with the keepalive (see setInterval below). The helper caches verdicts
-// by request-hash for 5 minutes, so retrying the same body is free — it
-// either returns cached results or joins the still-running computation
-// instead of starting a fresh Claude call.
-async function postEvaluateWithRetry(payload, maxAttempts = 2) {
-  const body = JSON.stringify(payload);
+// Stream a batch of listings through the native-messaging host. Returns an
+// array of verdict objects in arrival order (not necessarily input order —
+// chunks complete independently). The host's port-per-batch lifecycle pays
+// the Python cold-start once per batch and amortizes claude CLI startup
+// across chunks; no HTTP retry, no _result_cache — port-disconnect is the
+// only failure mode and already-streamed verdicts are committed
+// incrementally by the caller.
+async function runEvaluateBatchStreaming(listings, costParams, onVerdictStreamed) {
   const traceId = `eval-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-  const ids = (payload.listings || []).map((l) => l.id);
+  const ids = listings.map((l) => l.id);
   mwLog("helper_call_start", "info", {
     traceId,
-    attempts: maxAttempts,
     listingIds: ids,
-    bodyChars: body.length,
+    listing_count: listings.length,
   });
-  let lastErr;
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const t0 = Date.now();
-    try {
-      const resp = await fetch(HELPER_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body,
-      });
-      const elapsedMs = Date.now() - t0;
-      if (!resp.ok) {
-        const text = await resp.text();
-        // 5xx might be transient; 4xx won't get better with a retry.
-        if (resp.status >= 500 && attempt < maxAttempts) {
-          lastErr = new Error(`helper ${resp.status}: ${text.slice(0, 200)}`);
-          console.warn(`[mw] helper ${resp.status}, retrying (attempt ${attempt + 1}/${maxAttempts})`);
-          mwLog("helper_call_retry", "warn", { traceId, attempt, status: resp.status, elapsedMs, body: text.slice(0, 500) });
-          await sleep(2000);
-          continue;
-        }
-        mwLog("helper_call_end", "error", { traceId, attempt, status: resp.status, elapsedMs, body: text.slice(0, 500) });
-        throw new Error(`helper ${resp.status}: ${text.slice(0, 200)}`);
+  const t0 = Date.now();
+  const verdicts = [];
+  let batchError = null;
+
+  const piggybackLogs = await consumeLogBuffer();
+
+  await runEvaluateBatch({
+    listings,
+    costParams,
+    piggybackLogs,
+    onVerdict: (verdict) => {
+      verdicts.push(verdict);
+      if (onVerdictStreamed) {
+        try { onVerdictStreamed(verdict); } catch (_) {}
       }
-      const json = await resp.json();
-      mwLog("helper_call_end", "info", {
-        traceId, attempt, elapsedMs, status: 200,
-        verdicts: json.verdicts || [],
-      });
-      return json.verdicts || [];
-    } catch (e) {
-      const elapsedMs = Date.now() - t0;
-      lastErr = e;
-      if (attempt < maxAttempts) {
-        console.warn(`[mw] helper fetch failed (${e.message}), retrying (attempt ${attempt + 1}/${maxAttempts})`);
-        mwLog("helper_call_retry", "warn", { traceId, attempt, elapsedMs, error: e.message });
-        await sleep(2000);
-        continue;
-      }
-      mwLog("helper_call_end", "error", { traceId, attempt, elapsedMs, error: e.message });
-      throw e;
-    }
+    },
+    onError: (err) => { batchError = err; },
+  });
+
+  const elapsedMs = Date.now() - t0;
+  if (batchError) {
+    mwLog("helper_call_end", "error", { traceId, elapsedMs, error: batchError });
+    const e = new Error(`${batchError.code || "host_error"}: ${batchError.message || ""}`);
+    e.batchError = batchError;
+    throw e;
   }
-  throw lastErr;
+  mwLog("helper_call_end", "info", {
+    traceId, elapsedMs, status: "ok", verdicts,
+  });
+  return verdicts;
 }
 
 async function checkHelperHealth() {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), HELPER_HEALTH_TIMEOUT_MS);
-  try {
-    const resp = await fetch(HELPER_HEALTH_URL, { signal: ctrl.signal });
-    return resp.ok;
-  } catch (e) {
-    return false;
-  } finally {
-    clearTimeout(timer);
-  }
+  const piggybackLogs = await consumeLogBuffer();
+  const result = await checkHealthOneShot(piggybackLogs);
+  if (result.error) return false;
+  return result.claude_cli && result.claude_cli.status === "ok";
 }
 
 async function handleEvaluate(listingIds, sourceTabId, options = {}) {
   const includeImages = !!options.includeImages;
 
   // Fail-fast: a 40-second scrape phase is wasted effort if the helper
-  // isn't running. Confirm reachability before we open any tabs.
+  // isn't reachable. Confirm before we open any tabs.
   const helperUp = await checkHelperHealth();
   if (!helperUp) {
-    const msg = "Helper not running — start it with: python3 helper/server.py";
+    const msg = "Helper unreachable — run `marketplace-watcher doctor` to diagnose, " +
+                "or `marketplace-watcher install` if the host has never been installed.";
     console.warn("[mw] " + msg);
     sendProgress(sourceTabId, { phase: "error", error: msg });
     return { error: msg };
@@ -409,6 +426,7 @@ async function handleEvaluate(listingIds, sourceTabId, options = {}) {
   }
 
   let verdicts = [];
+  const updates = {};
   if (valid.length) {
     sendProgress(sourceTabId, { phase: "evaluating" });
     console.log("[mw] sending to helper:", valid.map(v => ({
@@ -418,35 +436,44 @@ async function handleEvaluate(listingIds, sourceTabId, options = {}) {
       hasContext: !!v.user_context,
       imageCount: v.images_b64 ? v.images_b64.length : 0,
     })));
+    const costParams = {
+      hourly_rate: HOURLY_TIME_COST,
+      gas_per_gallon: GAS_COST_PER_GALLON,
+      mpg: AVG_MPG,
+    };
     try {
-      verdicts = await postEvaluateWithRetry({ listings: valid });
+      // Verdicts stream in as chunks complete. Persist each one to
+      // chrome.storage.local immediately so a mid-batch disconnect leaves
+      // the completed verdicts cached — the next attempt will see them in
+      // the verdict:<id> cache and skip them.
+      verdicts = await runEvaluateBatchStreaming(valid, costParams, async (v) => {
+        const item = valid.find((s) => s.id === v.id);
+        const imgCount = item?.images_b64 ? item.images_b64.length : 0;
+        const entry = {
+          ...v,
+          title: item?.title,
+          price: item?.price,
+          location: item?.location,
+          description: item?.description,
+          user_context: item?.user_context,
+          distance_miles: item?.distance_miles,
+          drive_time_one_way_min: item?.drive_time_one_way_min,
+          round_trip_gas_cost: item?.round_trip_gas_cost,
+          round_trip_time_cost: item?.round_trip_time_cost,
+          images_included: imgCount > 0,
+          image_count: imgCount,
+          evaluatedAt: Date.now(),
+        };
+        updates[`verdict:${v.id}`] = entry;
+        await chrome.storage.local.set({ [`verdict:${v.id}`]: entry });
+      });
       console.log("[mw] verdicts:", verdicts);
     } catch (e) {
       console.error("[mw] helper error:", e.message);
       sendProgress(sourceTabId, { phase: "error", error: e.message });
-      return { error: e.message };
+      // Don't abort — some verdicts may have streamed in already; preserve
+      // them. Fall through to return them with an error marker for the rest.
     }
-  }
-
-  const updates = {};
-  for (const v of verdicts) {
-    const item = valid.find((s) => s.id === v.id);
-    const imgCount = item?.images_b64 ? item.images_b64.length : 0;
-    updates[`verdict:${v.id}`] = {
-      ...v,
-      title: item?.title,
-      price: item?.price,
-      location: item?.location,
-      description: item?.description, // store so user can verify what was evaluated
-      user_context: item?.user_context,
-      distance_miles: item?.distance_miles,
-      drive_time_one_way_min: item?.drive_time_one_way_min,
-      round_trip_gas_cost: item?.round_trip_gas_cost,
-      round_trip_time_cost: item?.round_trip_time_cost,
-      images_included: imgCount > 0,
-      image_count: imgCount,
-      evaluatedAt: Date.now(),
-    };
   }
   // Persist scrape-side failures (no description, scrape timeout, etc.) too,
   // so the ERR badge survives page reloads instead of going back to an
@@ -539,15 +566,6 @@ function sendProgress(tabId, payload) {
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
-
-// Firefox MV3 background scripts are non-persistent event pages and can be
-// suspended after ~30s of "inactivity." Active fetches *should* count, but
-// the implementation occasionally drops long requests, surfacing as a
-// BrokenPipeError on the helper side. Poking a chrome.runtime API every
-// 20s registers as activity and keeps the page alive across long batches.
-setInterval(() => {
-  chrome.runtime.getPlatformInfo().catch(() => {});
-}, 20000);
 
 // --- Image fetch --------------------------------------------------------
 //
