@@ -345,15 +345,13 @@
 }
 
 /* Hide rules — body class controls each kind. Body classes are added when
-   the user UNCHECKS that kind in the filter popover.
-   The data-mw-card value is the listing ID (anything non-empty), so we
-   match by attribute presence rather than a fixed value. */
-body.mw-hide-skip [data-mw-card]:has(.mw-badge.mw-skip) { display: none !important; }
-body.mw-hide-fair [data-mw-card]:has(.mw-badge.mw-fair) { display: none !important; }
-body.mw-hide-good [data-mw-card]:has(.mw-badge.mw-good) { display: none !important; }
-body.mw-hide-steal [data-mw-card]:has(.mw-badge.mw-steal) { display: none !important; }
-body.mw-hide-error [data-mw-card]:has(.mw-badge.mw-error) { display: none !important; }
-body.mw-hide-unanalyzed [data-mw-card]:has(.mw-checkbox) { display: none !important; }
+   the user UNCHECKS that kind in the filter popover. */
+body.mw-hide-skip [data-mw-card][data-mw-state="skip"] { display: none !important; }
+body.mw-hide-fair [data-mw-card][data-mw-state="fair"] { display: none !important; }
+body.mw-hide-good [data-mw-card][data-mw-state="good"] { display: none !important; }
+body.mw-hide-steal [data-mw-card][data-mw-state="steal"] { display: none !important; }
+body.mw-hide-error [data-mw-card][data-mw-state="error"] { display: none !important; }
+body.mw-hide-unanalyzed [data-mw-card][data-mw-state="unanalyzed"] { display: none !important; }
 body.mw-hide-sponsored [data-mw-sponsored="1"] { display: none !important; }
 
 #mw-setloc {

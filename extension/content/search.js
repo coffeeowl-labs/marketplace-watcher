@@ -156,6 +156,7 @@ function attachOverlays() {
     const innerId = inner ? extractListingId(inner.getAttribute("href") || "") : null;
     if (innerId !== el.dataset.mwCard) {
       el.removeAttribute("data-mw-card");
+      delete el.dataset.mwState;
       el.querySelectorAll(".mw-checkbox, .mw-badge").forEach((n) => n.remove());
     }
   }
@@ -179,6 +180,7 @@ function attachOverlays() {
     // instead of leaving a stale badge pinned to an unrelated card.
     if (card.dataset.mwCard === id) continue;
     if (card.dataset.mwCard) {
+      delete card.dataset.mwState;
       card.querySelectorAll(".mw-checkbox, .mw-badge").forEach((n) => n.remove());
     }
     card.dataset.mwCard = id;
@@ -272,6 +274,7 @@ function attachCheckbox(card, id) {
     true
   );
   apply();
+  card.dataset.mwState = "unanalyzed";
   card.appendChild(box);
 }
 
@@ -279,6 +282,7 @@ function attachBadge(card, verdict) {
   const badge = document.createElement("div");
   const v = verdict.verdict || "error";
   badge.className = `mw-badge mw-${v}`;
+  card.dataset.mwState = v;
   badge.textContent = (verdict.error ? "ERR" : v).toUpperCase();
   if (cachedContexts[verdict.id]) badge.classList.add("mw-has-context");
   badge.addEventListener("contextmenu", (e) => {
@@ -669,6 +673,7 @@ async function onEvaluateClick() {
 function refreshAllOverlays() {
   document.querySelectorAll("[data-mw-card]").forEach((el) => {
     el.removeAttribute("data-mw-card");
+    delete el.dataset.mwState;
     el.querySelectorAll(".mw-checkbox, .mw-badge").forEach((n) => n.remove());
   });
   attachOverlays();

@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "marketplace-watcher"
+version = "0.1.0"
+description = "Native-messaging host for the Marketplace Watcher Firefox extension. Evaluates Facebook Marketplace listings via the Claude CLI."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Ryan Jacobs" }]
+keywords = ["firefox", "extension", "native-messaging", "claude", "marketplace"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+  "platformdirs>=4.0",
+]
+
+[project.scripts]
+marketplace-watcher = "marketplace_watcher.cli:main"
+marketplace-watcher-host = "marketplace_watcher.host:main"
+
+[project.urls]
+Repository = "https://github.com/coffeeowl-labs/marketplace-watcher"
+Issues = "https://github.com/coffeeowl-labs/marketplace-watcher/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["marketplace_watcher"]
