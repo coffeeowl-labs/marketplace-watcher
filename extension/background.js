@@ -132,9 +132,30 @@ const NOMINATIM_URL = "https://nominatim.openstreetmap.org/search";
 const NOMINATIM_MIN_INTERVAL_MS = 1100; // be polite to OSM's free service
 const OSRM_URL = "https://router.project-osrm.org/route/v1/driving";
 const OSRM_MIN_INTERVAL_MS = 1100;
-const HOURLY_TIME_COST = 20;
-const GAS_COST_PER_GALLON = 5;
-const AVG_MPG = 25;
+// Identify ourselves to Nominatim/OSRM so a friend group sharing the tool
+// doesn't trip a blanket block on an anonymous User-Agent. Both upstreams
+// explicitly require a contact identifier in their usage policies.
+const UPSTREAM_USER_AGENT =
+  "marketplace-watcher/0.1.0 (+https://github.com/coffeeowl-labs/marketplace-watcher)";
+const UPSTREAM_FETCH_HEADERS = {
+  "User-Agent": UPSTREAM_USER_AGENT,
+  "Referer": "https://github.com/coffeeowl-labs/marketplace-watcher",
+};
+// Defaults; the options page overrides these via chrome.storage.local.cost_params.
+const DEFAULT_COST_PARAMS = Object.freeze({
+  hourly_rate: 20,
+  gas_per_gallon: 5,
+  mpg: 25,
+});
+
+async function getCostParams() {
+  const stored = (await chrome.storage.local.get("cost_params")).cost_params || {};
+  return {
+    hourly_rate: Number.isFinite(stored.hourly_rate) ? stored.hourly_rate : DEFAULT_COST_PARAMS.hourly_rate,
+    gas_per_gallon: Number.isFinite(stored.gas_per_gallon) ? stored.gas_per_gallon : DEFAULT_COST_PARAMS.gas_per_gallon,
+    mpg: Number.isFinite(stored.mpg) ? stored.mpg : DEFAULT_COST_PARAMS.mpg,
+  };
+}
 // OSRM gives free-flow (no-traffic) distance and duration. We deliberately
 // do NOT apply a traffic multiplier — the user picks when to drive.
 // Haversine fallback constants used only when OSRM is unreachable:
@@ -188,7 +209,31 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
     return false;
   }
+  if (msg.type === "save_user_location") {
+    saveUserLocation(msg.address)
+      .then(sendResponse)
+      .catch((e) => sendResponse({ ok: false, error: e.message }));
+    return true;
+  }
 });
+
+async function saveUserLocation(rawAddress) {
+  const trimmed = (rawAddress || "").trim();
+  if (!trimmed) {
+    await chrome.storage.local.remove("user_location");
+    return { ok: true, removed: true };
+  }
+  const geo = await geocode(trimmed);
+  if (!geo) {
+    return {
+      ok: false,
+      error: "Could not geocode address. Try '123 Main St, Cityville, ST 12345' format.",
+    };
+  }
+  const result = { raw: trimmed, lat: geo.lat, lng: geo.lng, display: geo.display };
+  await chrome.storage.local.set({ user_location: result });
+  return { ok: true, location: result };
+}
 
 async function enqueueScrape(id) {
   // Cache hit?
@@ -211,6 +256,7 @@ async function enqueueScrape(id) {
 async function startScrapeWorker() {
   scrapeWorkerRunning = true;
   const userLoc = await getUserLocation();
+  const costParams = await getCostParams();
 
   while (scrapeQueue.length > 0) {
     const { id, resolve, reject } = scrapeQueue.shift();
@@ -221,7 +267,7 @@ async function startScrapeWorker() {
       if (userLoc && data.location) {
         const listingGeo = await geocode(data.location);
         if (listingGeo) {
-          const trip = await computeTrip(userLoc, listingGeo);
+          const trip = await computeTrip(userLoc, listingGeo, costParams);
           Object.assign(enriched, trip);
         }
       }
@@ -436,11 +482,7 @@ async function handleEvaluate(listingIds, sourceTabId, options = {}) {
       hasContext: !!v.user_context,
       imageCount: v.images_b64 ? v.images_b64.length : 0,
     })));
-    const costParams = {
-      hourly_rate: HOURLY_TIME_COST,
-      gas_per_gallon: GAS_COST_PER_GALLON,
-      mpg: AVG_MPG,
-    };
+    const costParams = await getCostParams();
     try {
       // Verdicts stream in as chunks complete. Persist each one to
       // chrome.storage.local immediately so a mid-batch disconnect leaves
@@ -648,7 +690,7 @@ async function geocode(query) {
   // postal code in Vladivostok). Revisit if non-US use is needed.
   const url = `${NOMINATIM_URL}?q=${encodeURIComponent(query)}&format=json&limit=1&countrycodes=us`;
   try {
-    const resp = await fetch(url);
+    const resp = await fetch(url, { headers: UPSTREAM_FETCH_HEADERS });
     if (!resp.ok) {
       console.warn(`[mw] geocode ${query}: ${resp.status}`);
       return null;
@@ -692,7 +734,7 @@ async function osrmRoute(from, to) {
 
   const url = `${OSRM_URL}/${from.lng},${from.lat};${to.lng},${to.lat}?overview=false`;
   try {
-    const resp = await fetch(url);
+    const resp = await fetch(url, { headers: UPSTREAM_FETCH_HEADERS });
     if (!resp.ok) {
       console.warn(`[mw] OSRM ${resp.status}`);
       return null;
@@ -709,9 +751,9 @@ async function osrmRoute(from, to) {
   }
 }
 
-function tripFromMilesAndMinutes(miles, minutesOneWay) {
-  const gas = ((miles * 2) / AVG_MPG) * GAS_COST_PER_GALLON;
-  const time = (minutesOneWay / 60) * 2 * HOURLY_TIME_COST;
+function tripFromMilesAndMinutes(miles, minutesOneWay, costParams) {
+  const gas = ((miles * 2) / costParams.mpg) * costParams.gas_per_gallon;
+  const time = (minutesOneWay / 60) * 2 * costParams.hourly_rate;
   return {
     distance_miles: round1(miles),
     drive_time_one_way_min: Math.round(minutesOneWay),
@@ -720,17 +762,17 @@ function tripFromMilesAndMinutes(miles, minutesOneWay) {
   };
 }
 
-async function computeTrip(from, to) {
+async function computeTrip(from, to, costParams) {
   const route = await osrmRoute(from, to);
   if (route) {
     const miles = route.meters / 1609.344;
     const minutes = route.seconds / 60;
-    return tripFromMilesAndMinutes(miles, minutes);
+    return tripFromMilesAndMinutes(miles, minutes, costParams);
   }
   // OSRM unreachable — fall back to crow-flies estimate
   const miles = haversineMiles(from, to) * FALLBACK_ROAD_FACTOR;
   const minutes = (miles / FALLBACK_AVG_SPEED_MPH) * 60;
-  return tripFromMilesAndMinutes(miles, minutes);
+  return tripFromMilesAndMinutes(miles, minutes, costParams);
 }
 
 function haversineMiles(a, b) {

@@ -203,6 +203,67 @@ async function flushLogsOneShot(logs) {
   });
 }
 
+// Re-runs the host's install step (re-resolves Claude CLI path, rewrites
+// the native-host manifest). The host exits after replying, so the caller
+// must open a fresh port for any subsequent work.
+async function reinstallOneShot() {
+  return new Promise((resolve) => {
+    let port;
+    try {
+      port = browser.runtime.connectNative(NATIVE_HOST_NAME);
+    } catch (e) {
+      resolve({ error: { code: "host_connect_failed", message: e.message } });
+      return;
+    }
+    let settled = false;
+    const reqId = newRequestId();
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { port.disconnect(); } catch (_) {}
+      resolve({ error: { code: "host_timeout", message: "reinstall timed out" } });
+    }, 15000);
+
+    port.onMessage.addListener((msg) => {
+      if (!msg || msg.request_id !== reqId) return;
+      if (msg.type === MSG_REINSTALL_DONE) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try { port.disconnect(); } catch (_) {}
+        resolve(msg);
+      } else if (msg.type === MSG_ERROR) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try { port.disconnect(); } catch (_) {}
+        resolve({ error: { code: msg.code, message: msg.message } });
+      }
+    });
+
+    port.onDisconnect.addListener(() => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const err = port.error ? port.error.message : "host disconnect";
+      resolve({ error: { code: "host_disconnect", message: err } });
+    });
+
+    try {
+      port.postMessage({
+        type: MSG_REINSTALL,
+        schema_version: SCHEMA_VERSION,
+        request_id: reqId,
+      });
+    } catch (e) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ error: { code: "post_failed", message: e.message } });
+    }
+  });
+}
+
 // Long-lived status port for the options page. Returns a Port-like wrapper
 // that handles request/response matching and reconnection. Reserved for
 // §5 options page; not used by background-side code today.

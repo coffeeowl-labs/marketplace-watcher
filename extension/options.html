@@ -1,43 +1,74 @@
 <!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <title>Marketplace Watcher Settings</title>
-    <style>
-      body {
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-        background: #1a1a1a;
-        color: #eee;
-        padding: 20px;
-        min-width: 380px;
-      }
-      h1 { font-size: 16px; margin: 0 0 16px 0; }
-      .row { display: flex; align-items: flex-start; gap: 10px; padding: 8px 0; }
-      .row input[type="checkbox"] { margin-top: 3px; width: 16px; height: 16px; }
-      .row label { flex: 1; cursor: pointer; }
-      .hint { font-size: 12px; color: #999; line-height: 1.4; margin-top: 4px; }
-      .status { font-size: 12px; color: #4caf50; margin-top: 12px; min-height: 16px; }
-      code { background: #2a2a2a; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
-    </style>
-  </head>
-  <body>
-    <h1>Marketplace Watcher Settings</h1>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Marketplace Watcher — Settings</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
 
-    <div class="row">
-      <input type="checkbox" id="debug_logging" />
-      <label for="debug_logging">
-        <div><b>Debug logging</b></div>
-        <div class="hint">
-          Send detailed events (scrape internals, helper calls, cache hits) to
-          the local helper for troubleshooting. Logs are appended to
-          <code>~/.local/state/marketplace_watcher/events.jsonl</code>.
-          Errors and warnings are always logged regardless of this setting.
-        </div>
+<header>
+  <h1>Marketplace Watcher</h1>
+  <div id="status-row" class="status-row" aria-live="polite">
+    <span id="status-helper" class="pill pill-pending">helper: <span class="pill-val">…</span></span>
+    <span id="status-claude" class="pill pill-pending">claude: <span class="pill-val">…</span></span>
+    <span id="status-last" class="pill pill-pending">last: <span class="pill-val">never</span></span>
+  </div>
+</header>
+
+<div id="first-run-banner" hidden>
+  <strong>Welcome.</strong> Set your home address to enable trip-cost analysis on listings.
+</div>
+
+<main>
+  <section class="field-section">
+    <label for="home-address">Home address</label>
+    <input type="text" id="home-address"
+           placeholder="123 Main St, Cityville, ST 12345"
+           autocomplete="street-address">
+    <div id="address-resolved" class="help"></div>
+  </section>
+
+  <section class="field-row">
+    <div class="field">
+      <label for="hourly-rate">Hourly time cost ($/hr)</label>
+      <input type="number" id="hourly-rate" min="0" step="0.5" value="20">
+    </div>
+    <div class="field">
+      <label for="gas-price">Gas price ($/gal)</label>
+      <input type="number" id="gas-price" min="0" step="0.01" value="5">
+    </div>
+    <div class="field">
+      <label for="mpg">Vehicle efficiency (MPG)</label>
+      <input type="number" id="mpg" min="1" step="1" value="25">
+    </div>
+  </section>
+
+  <section class="actions">
+    <button id="save-btn" type="button">Save</button>
+    <span id="save-status" aria-live="polite"></span>
+  </section>
+
+  <details class="advanced">
+    <summary>Advanced</summary>
+    <div class="advanced-body">
+      <button id="reinstall-btn" type="button">Reinstall native host</button>
+      <div id="reinstall-status" aria-live="polite"></div>
+
+      <div class="kv">
+        <span class="k">Log file:</span> <code id="log-path">—</code>
+      </div>
+
+      <label class="cb">
+        <input type="checkbox" id="debug-logging">
+        Debug logging (more detail in host log; default on)
       </label>
     </div>
+  </details>
+</main>
 
-    <div class="status" id="status"></div>
-
-    <script src="options.js"></script>
-  </body>
+<script src="protocol.js"></script>
+<script src="native_messaging.js"></script>
+<script src="options.js"></script>
+</body>
 </html>
