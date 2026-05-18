@@ -1,3 +1,26 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+.venv/
+
+# Editor / OS
 .DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Project local
+.env
+*.local.json
+events.jsonl
+events.log*
+
+# AMO credentials — never commit
+.amo-credentials
+web-ext-artifacts/
