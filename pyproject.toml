@@ -26,6 +26,11 @@ dependencies = [
   "platformdirs>=4.0",
 ]
 
+[dependency-groups]
+dev = [
+  "pytest>=8.0",
+]
+
 [project.scripts]
 marketplace-watcher = "marketplace_watcher.cli:main"
 marketplace-watcher-host = "marketplace_watcher.host:main"

@@ -24,3 +24,5 @@ events.log*
 # AMO credentials — never commit
 .amo-credentials
 web-ext-artifacts/
+# web-ext sign session state (upload UUIDs are per-build, not source).
+extension/.amo-upload-uuid
