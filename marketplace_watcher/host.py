@@ -43,7 +43,6 @@ from .protocol import (
 
 _LEN_FMT = "<I"  # 4-byte little-endian unsigned (native-messaging spec)
 
-_last_evaluation: dict = {"ts_iso": None, "ok": None, "error": None}
 _shutdown = threading.Event()
 
 
@@ -143,13 +142,6 @@ def _send_error(req_id: Optional[str], err: dict) -> None:
     _write_message(payload)
 
 
-def _record_last_eval(ok: bool, error: Optional[dict]) -> None:
-    import datetime
-    _last_evaluation["ts_iso"] = datetime.datetime.now().isoformat(timespec="seconds")
-    _last_evaluation["ok"] = ok
-    _last_evaluation["error"] = error
-
-
 def _handle_evaluate(msg: dict, config: Config) -> None:
     req_id = msg["request_id"]
     listings = msg.get("listings")
@@ -183,7 +175,6 @@ def _handle_evaluate(msg: dict, config: Config) -> None:
             "error": {"code": "claude_missing",
                       "message": "claude path not configured"},
         })
-        _record_last_eval(False, {"code": "claude_missing"})
         return
 
     seq_counter = [0]
@@ -206,7 +197,6 @@ def _handle_evaluate(msg: dict, config: Config) -> None:
             "request_id": req_id,
             "error": error,
         })
-        _record_last_eval(error is None, error)
 
     evaluate_parallel_streaming(listings, config.claude_path, cost,
                                 on_verdict, on_done)
@@ -234,7 +224,6 @@ def _handle_health(msg: dict, config: Config) -> None:
         "manifest_schema_version": config.manifest_schema_version,
         "expected_manifest_schema": MANIFEST_SCHEMA_VERSION,
         "log_path": str(log_path()),
-        "last_evaluation": dict(_last_evaluation),
     })
 
 

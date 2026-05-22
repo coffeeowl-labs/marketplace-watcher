@@ -111,7 +111,6 @@ function renderHealth(msg) {
   if (msg.error) {
     setPill(els.pillHelper, "helper", "disconnected", "err");
     setPill(els.pillClaude, "claude", "—", "pending");
-    setPill(els.pillLast, "last", "—", "pending");
     return;
   }
   setPill(els.pillHelper, "helper", "connected", "ok");
@@ -125,22 +124,30 @@ function renderHealth(msg) {
     setPill(els.pillClaude, "claude", cli.status || "unknown", "warn");
   }
 
-  const le = msg.last_evaluation || {};
-  if (le.ts_iso) {
-    const when = formatAge(le.ts_iso);
-    if (le.ok === true) {
-      setPill(els.pillLast, "last", `${when} · ok`, "ok");
-    } else if (le.ok === false) {
-      const code = le.error && le.error.code ? le.error.code : "error";
-      setPill(els.pillLast, "last", `${when} · ${code}`, "err");
-    } else {
-      setPill(els.pillLast, "last", when, "pending");
-    }
-  } else {
-    setPill(els.pillLast, "last", "never", "pending");
-  }
-
   if (msg.log_path) els.logPath.textContent = msg.log_path;
+}
+
+// The last-evaluation pill is sourced from chrome.storage.local, not the
+// host's health response — the host process is short-lived (spawned per
+// connectNative call) so any in-memory timestamp it tracks would always
+// be gone before the next health poll. Background writes after every
+// batch; we read on load and on storage changes.
+async function refreshLastPill() {
+  const data = await chrome.storage.local.get("last_evaluation");
+  const le = data.last_evaluation || {};
+  if (!le.ts_iso) {
+    setPill(els.pillLast, "last", "never", "pending");
+    return;
+  }
+  const when = formatAge(le.ts_iso);
+  if (le.ok === true) {
+    setPill(els.pillLast, "last", `${when} · ok`, "ok");
+  } else if (le.ok === false) {
+    const code = le.error && le.error.code ? le.error.code : "error";
+    setPill(els.pillLast, "last", `${when} · ${code}`, "err");
+  } else {
+    setPill(els.pillLast, "last", when, "pending");
+  }
 }
 
 function setPill(el, label, value, kind) {
@@ -177,12 +184,12 @@ function openStatus() {
         : (msg.message || msg.code);
       setPill(els.pillHelper, "helper", text, "err");
       setPill(els.pillClaude, "claude", "—", "pending");
-      setPill(els.pillLast, "last", "—", "pending");
+      // last pill is independent of host state — leave it alone.
     },
     onDisconnect: () => {
       setPill(els.pillHelper, "helper", "disconnected", "err");
       setPill(els.pillClaude, "claude", "—", "pending");
-      setPill(els.pillLast, "last", "—", "pending");
+      // last pill is independent of host state — leave it alone.
       setTimeout(() => { if (!document.hidden) openStatus(); }, 2000);
     },
   });
@@ -193,7 +200,11 @@ let pollTimer = null;
 function startPolling() {
   stopPolling();
   pollTimer = setInterval(() => {
-    if (document.hidden || !statusPort) return;
+    if (document.hidden) return;
+    // Keep the "last" pill's "Xm ago" string ticking up even when no new
+    // batch has run — formatAge derives from the storage timestamp.
+    refreshLastPill().catch(() => {});
+    if (!statusPort) return;
     try { statusPort.requestHealth(); } catch (_) { openStatus(); }
   }, 5000);
 }
@@ -226,10 +237,16 @@ async function runReinstall() {
 
 document.addEventListener("DOMContentLoaded", () => {
   loadInitial().catch((e) => console.error("[mw options] load failed:", e));
+  refreshLastPill().catch((e) => console.error("[mw options] last pill load failed:", e));
   els.saveBtn.addEventListener("click", saveAll);
   els.reinstallBtn.addEventListener("click", runReinstall);
   els.address.addEventListener("input", () => {
     if (els.address.value.trim()) els.banner.hidden = true;
+  });
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes.last_evaluation) {
+      refreshLastPill().catch(() => {});
+    }
   });
   openStatus();
   startPolling();

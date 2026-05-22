@@ -680,6 +680,10 @@ function refreshAllOverlays() {
 }
 
 chrome.runtime.onMessage.addListener((msg) => {
+  if (msg.type === "verdict_streamed") {
+    onVerdictStreamed(msg.verdict, msg.done, msg.total);
+    return;
+  }
   if (msg.type !== "progress") return;
   const fab = document.getElementById("mw-fab");
   if (!fab) return;
@@ -688,6 +692,9 @@ chrome.runtime.onMessage.addListener((msg) => {
   } else if (msg.phase === "images") {
     fab.textContent = "Downloading photos…";
   } else if (msg.phase === "evaluating") {
+    // Initial state before any verdicts have streamed back. Once
+    // onVerdictStreamed starts firing it'll overwrite this with a
+    // running count.
     fab.textContent = "Evaluating with Claude…";
   } else if (msg.phase === "done") {
     fab.textContent = "Done";
@@ -695,6 +702,25 @@ chrome.runtime.onMessage.addListener((msg) => {
     fab.textContent = `Error: ${msg.error}`;
   }
 });
+
+// Per-verdict streaming handler. Paint the badge on the matching card as
+// soon as the verdict arrives so the user sees progress instead of a
+// long opaque wait. The batch's final response (in onEvaluateClick)
+// still runs refreshAllOverlays as a backstop for anything we missed.
+function onVerdictStreamed(verdict, done, total) {
+  if (!verdict || !verdict.id) return;
+  cachedVerdicts[verdict.id] = verdict;
+  selectedIds.delete(verdict.id);
+  const card = document.querySelector(`[data-mw-card="${verdict.id}"]`);
+  if (card) {
+    card.querySelectorAll(".mw-checkbox, .mw-badge").forEach((n) => n.remove());
+    attachBadge(card, verdict);
+  }
+  const fab = document.getElementById("mw-fab");
+  if (fab && Number.isFinite(done) && Number.isFinite(total)) {
+    fab.textContent = `Evaluating ${done}/${total}…`;
+  }
+}
 
 function extractListingId(href) {
   const m = href.match(/\/marketplace\/item\/(\d+)/);

@@ -487,7 +487,9 @@ async function handleEvaluate(listingIds, sourceTabId, options = {}) {
       // Verdicts stream in as chunks complete. Persist each one to
       // chrome.storage.local immediately so a mid-batch disconnect leaves
       // the completed verdicts cached — the next attempt will see them in
-      // the verdict:<id> cache and skip them.
+      // the verdict:<id> cache and skip them. Also push to the source tab
+      // so cards repaint one-by-one instead of all-at-once at batch end.
+      let streamedCount = 0;
       verdicts = await runEvaluateBatchStreaming(valid, costParams, async (v) => {
         const item = valid.find((s) => s.id === v.id);
         const imgCount = item?.images_b64 ? item.images_b64.length : 0;
@@ -508,11 +510,42 @@ async function handleEvaluate(listingIds, sourceTabId, options = {}) {
         };
         updates[`verdict:${v.id}`] = entry;
         await chrome.storage.local.set({ [`verdict:${v.id}`]: entry });
+        streamedCount += 1;
+        if (sourceTabId != null) {
+          try {
+            await chrome.tabs.sendMessage(sourceTabId, {
+              type: "verdict_streamed",
+              verdict: entry,
+              done: streamedCount,
+              total: valid.length,
+            });
+          } catch (_) {
+            // Tab closed mid-batch; drop the message. The verdict is
+            // still in storage, so a reload will pick it up.
+          }
+        }
       });
       console.log("[mw] verdicts:", verdicts);
+      await chrome.storage.local.set({
+        last_evaluation: {
+          ts_iso: new Date().toISOString(),
+          ok: true,
+          error: null,
+        },
+      });
     } catch (e) {
       console.error("[mw] helper error:", e.message);
       sendProgress(sourceTabId, { phase: "error", error: e.message });
+      const errPayload = e.batchError
+        ? { code: e.batchError.code, message: e.batchError.message }
+        : { code: "host_error", message: e.message };
+      await chrome.storage.local.set({
+        last_evaluation: {
+          ts_iso: new Date().toISOString(),
+          ok: false,
+          error: errPayload,
+        },
+      });
       // Don't abort — some verdicts may have streamed in already; preserve
       // them. Fall through to return them with an error marker for the rest.
     }
