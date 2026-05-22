@@ -40,6 +40,14 @@
 .mw-picker.mw-picker-profile:hover {
   background: #503872;
 }
+.mw-picker.mw-picker-junk {
+  background: #2a2a2a;
+  border-color: #555;
+  color: #ccc;
+}
+.mw-picker.mw-picker-junk:hover {
+  background: #1a1a1a;
+}
 .mw-picker-label {
   flex: 1;
   overflow: hidden;
@@ -89,6 +97,15 @@
   height: 1px;
   margin: 4px 0;
   background: rgba(255, 255, 255, 0.15);
+}
+/* Bottom-section action — visually de-emphasized so the eye doesn't
+   land on it as the default. */
+.mw-picker-option-junk {
+  color: #b0b0b0;
+}
+.mw-picker-option-junk:hover {
+  background: rgba(220, 38, 38, 0.18);
+  color: white;
 }
 
 .mw-badge {
@@ -413,6 +430,10 @@
     #424242 6px
   );
 }
+.mw-filter-swatch-junk {
+  background: #2a2a2a;
+  border: 1px dashed #888;
+}
 
 /* Hide rules — body class controls each kind. Body classes are added when
    the user UNCHECKS that kind in the filter popover. */
@@ -423,6 +444,17 @@ body.mw-hide-steal [data-mw-card][data-mw-state="steal"] { display: none !import
 body.mw-hide-error [data-mw-card][data-mw-state="error"] { display: none !important; }
 body.mw-hide-unanalyzed [data-mw-card][data-mw-state="unanalyzed"] { display: none !important; }
 body.mw-hide-sponsored [data-mw-sponsored="1"] { display: none !important; }
+/* Junked listings hide by default. The Filter popover's "Junk" toggle
+   reveals them so the user can un-junk via the picker. Junk-hide is
+   the most aggressive override — it wins over verdict-state filters
+   (a junked steal is still hidden when junk-hide is on). */
+body.mw-hide-junk [data-mw-card][data-mw-junk="1"] { display: none !important; }
+/* When junk-hide is OFF (user toggled "Junk" on in Filter), surface
+   junked cards as muted so they're easy to scan past unless intentional. */
+body:not(.mw-hide-junk) [data-mw-card][data-mw-junk="1"] {
+  opacity: 0.45;
+  filter: grayscale(0.6);
+}
 
 #mw-setloc {
   background: #2c3e50;

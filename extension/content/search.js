@@ -16,6 +16,12 @@ let cachedVerdicts = {}; // id -> verdict object
 let cachedContexts = {}; // id -> user-provided context string
 let currentProfiles = []; // [{id, name, prompt}]; mirrors chrome.storage.local.profiles
 let openPicker = null;   // { card, id, btn, popover } | null — at most one popover open
+// Listings the user has flagged as "Junk" via the picker. Persists across
+// page reloads and is filtered out of the result list by default — main
+// purpose is suppressing the same garbage listings Marketplace recycles
+// across searches (e.g. a blown-head-gasket car that keeps reappearing in
+// bike searches).
+const junkedIds = new Set();
 let mutationDebounceTimer = null;
 
 // Display order of filter rows in the popover.
@@ -27,10 +33,14 @@ const FILTER_KINDS = [
   { key: "error", label: "Error" },
   { key: "unanalyzed", label: "Unanalyzed" },
   { key: "sponsored", label: "Sponsored / Ads" },
+  { key: "junk", label: "Junk (hidden listings)" },
 ];
 
-// All visible by default except sponsored (nobody wants ads in their results).
-// Persisted under `filter_visibility`.
+// All visible by default except sponsored + junk (nobody wants ads or
+// already-rejected listings polluting their results). Persisted under
+// `filter_visibility`. Toggling "junk" on is how a user un-junks a
+// listing: junked cards reappear, picker shows "Junk" as current, pick
+// anything else to undo.
 const filterState = {
   steal: true,
   good: true,
@@ -39,6 +49,7 @@ const filterState = {
   error: true,
   unanalyzed: true,
   sponsored: false,
+  junk: false,
 };
 
 (async () => {
@@ -51,29 +62,60 @@ const filterState = {
 })();
 
 async function loadProfiles() {
-  const data = await chrome.storage.local.get("profiles");
+  const data = await chrome.storage.local.get(["profiles", "junked_ids"]);
   currentProfiles = Array.isArray(data.profiles) ? data.profiles : [];
+  junkedIds.clear();
+  if (Array.isArray(data.junked_ids)) {
+    for (const id of data.junked_ids) junkedIds.add(id);
+  }
+}
+
+async function persistJunkedIds() {
+  await chrome.storage.local.set({ junked_ids: Array.from(junkedIds) });
 }
 
 // React to profile edits in the Settings tab (or another Marketplace tab)
 // without requiring a page reload. Demote selections that referenced a
 // deleted profile to "default" and repaint any visible picker labels.
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== "local" || !changes.profiles) return;
-  const next = Array.isArray(changes.profiles.newValue) ? changes.profiles.newValue : [];
-  currentProfiles = next;
-  const liveIds = new Set(next.map((p) => p.id));
-  for (const [listingId, sel] of selections) {
-    if (sel !== "default" && !liveIds.has(sel)) {
-      selections.set(listingId, "default");
+  if (area !== "local") return;
+  if (changes.profiles) {
+    const next = Array.isArray(changes.profiles.newValue) ? changes.profiles.newValue : [];
+    currentProfiles = next;
+    const liveIds = new Set(next.map((p) => p.id));
+    for (const [listingId, sel] of selections) {
+      if (sel !== "default" && !liveIds.has(sel)) {
+        selections.set(listingId, "default");
+      }
+    }
+    for (const btn of document.querySelectorAll(".mw-picker")) {
+      updatePickerLabel(btn, btn.dataset.mwId);
+    }
+    // Close any open popover — its option list is now stale.
+    closeOpenPicker();
+  }
+  if (changes.junked_ids) {
+    // Another tab junked or un-junked something; mirror in this tab.
+    junkedIds.clear();
+    const next = Array.isArray(changes.junked_ids.newValue) ? changes.junked_ids.newValue : [];
+    for (const id of next) junkedIds.add(id);
+    // Walk every overlay card and re-apply the data-mw-junk attribute.
+    for (const card of document.querySelectorAll("[data-mw-card]")) {
+      applyJunkAttr(card, card.dataset.mwCard);
+    }
+    for (const btn of document.querySelectorAll(".mw-picker")) {
+      updatePickerLabel(btn, btn.dataset.mwId);
     }
   }
-  for (const btn of document.querySelectorAll(".mw-picker")) {
-    updatePickerLabel(btn, btn.dataset.mwId);
-  }
-  // Close any open popover — its option list is now stale.
-  closeOpenPicker();
 });
+
+function applyJunkAttr(card, id) {
+  if (junkedIds.has(id)) {
+    card.dataset.mwJunk = "1";
+  } else {
+    delete card.dataset.mwJunk;
+  }
+}
 
 async function loadFilterState() {
   const stored = await chrome.storage.local.get([
@@ -228,6 +270,7 @@ function attachOverlays() {
     if (cachedVerdicts[id]) {
       attachBadge(card, cachedVerdicts[id]);
     }
+    applyJunkAttr(card, id);
   }
   // If FB recycled the card the open popover is anchored to, close it —
   // otherwise we leak a phantom dropdown layer.
@@ -319,9 +362,22 @@ function attachPicker(card, id) {
 }
 
 function updatePickerLabel(btn, id) {
-  const sel = selections.get(id);
   const labelEl = btn.querySelector(".mw-picker-label");
-  btn.classList.remove("mw-picker-active", "mw-picker-profile");
+  btn.classList.remove("mw-picker-active", "mw-picker-profile", "mw-picker-junk");
+
+  // Junk wins over selection — a junked listing displays "Junk" even if
+  // it was previously in the batch (and selections will have been
+  // cleared when we junked it). Surface this state explicitly so the
+  // user knows what state they'll be acting against when re-opening the
+  // popover via the "Show junked" filter toggle.
+  if (junkedIds.has(id)) {
+    labelEl.textContent = "Junk";
+    btn.classList.add("mw-picker-junk");
+    btn.title = "Hidden from view. Pick anything else to un-junk.";
+    return;
+  }
+
+  const sel = selections.get(id);
   if (!sel) {
     labelEl.textContent = "None";
     btn.title = "Click to add this listing to the batch.";
@@ -358,16 +414,20 @@ function togglePicker(card, id, btn) {
   popover.className = "mw-picker-popover";
   popover.setAttribute("role", "menu");
 
+  const isJunked = junkedIds.has(id);
   const currentSel = selections.get(id); // undefined | "default" | profileId
-  const addOption = (val, displayLabel) => {
+  const addOption = (val, displayLabel, extraClass = "") => {
     const opt = document.createElement("button");
     opt.type = "button";
-    opt.className = "mw-picker-option";
+    opt.className = "mw-picker-option" + (extraClass ? " " + extraClass : "");
     opt.dataset.val = val;
     opt.textContent = displayLabel;
     opt.setAttribute("role", "menuitem");
-    const isCurrent =
-      (val === "none" && currentSel === undefined) || val === currentSel;
+    let isCurrent;
+    if (val === "junk") isCurrent = isJunked;
+    else if (isJunked) isCurrent = false; // junked listings have no batch state
+    else if (val === "none") isCurrent = currentSel === undefined;
+    else isCurrent = val === currentSel;
     if (isCurrent) opt.classList.add("mw-picker-option-current");
     opt.addEventListener("mousedown", (e) => e.stopPropagation());
     opt.addEventListener("click", (e) => {
@@ -377,15 +437,20 @@ function togglePicker(card, id, btn) {
     });
     popover.appendChild(opt);
   };
+  const addDivider = () => {
+    const d = document.createElement("div");
+    d.className = "mw-picker-divider";
+    popover.appendChild(d);
+  };
 
   addOption("none", "None");
   addOption("default", "Evaluate (default)");
   if (currentProfiles.length > 0) {
-    const divider = document.createElement("div");
-    divider.className = "mw-picker-divider";
-    popover.appendChild(divider);
+    addDivider();
     for (const p of currentProfiles) addOption(p.id, p.name);
   }
+  addDivider();
+  addOption("junk", "Junk (hide)", "mw-picker-option-junk");
 
   // Anchor under the button. The card already has position:relative
   // (set in attachOverlays for any non-static card), so absolute
@@ -408,8 +473,17 @@ function closeOpenPicker() {
 }
 
 function handlePickerSelection(id, val) {
-  if (val === "none") {
+  if (val === "junk") {
+    // Junking removes the listing from any batch state and hides it
+    // (unless the user has the "Junk" filter toggled on, which is the
+    // un-junk affordance).
     selections.delete(id);
+    junkedIds.add(id);
+    persistJunkedIds().catch(() => {});
+  } else if (val === "none") {
+    selections.delete(id);
+    // Picking "None" on a junked listing un-junks it.
+    if (junkedIds.delete(id)) persistJunkedIds().catch(() => {});
   } else {
     // Cap applies only when ADDING (changing an already-selected card's
     // profile shouldn't bump us over the cap).
@@ -419,6 +493,8 @@ function handlePickerSelection(id, val) {
       return;
     }
     selections.set(id, val);
+    // Picking Default-or-a-profile on a junked listing also un-junks.
+    if (junkedIds.delete(id)) persistJunkedIds().catch(() => {});
     // Eagerly scrape so the data is ready by the time the user clicks
     // Evaluate. Fire-and-forget; the queue dedupes against in-flight.
     chrome.runtime
@@ -429,10 +505,11 @@ function handlePickerSelection(id, val) {
   // If the listing already has a verdict and the user is changing the
   // profile, treat that as "I want to redo this with the new profile" —
   // bust the verdict cache and remove the badge so the next Evaluate
-  // re-runs this listing. Scraped data (the expensive part) is in a
-  // separate cache key and is preserved.
+  // re-runs this listing. Junk + None preserve the verdict (the cache
+  // is still useful — un-junking should restore the badge).
   const hadVerdict = !!cachedVerdicts[id];
-  if (hadVerdict && val !== "none") {
+  const isProfileChange = val !== "none" && val !== "junk";
+  if (hadVerdict && isProfileChange) {
     delete cachedVerdicts[id];
     chrome.storage.local.remove(`verdict:${id}`).catch(() => {});
     const card = document.querySelector(`[data-mw-card="${id}"]`);
@@ -442,11 +519,12 @@ function handlePickerSelection(id, val) {
     }
   }
 
-  // Repaint the picker label on this card.
+  // Repaint the picker label + apply/remove the junk data attribute.
   const card = document.querySelector(`[data-mw-card="${id}"]`);
   if (card) {
     const btn = card.querySelector(".mw-picker");
     if (btn) updatePickerLabel(btn, id);
+    applyJunkAttr(card, id);
   }
   closeOpenPicker();
   updateFAB();
