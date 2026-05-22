@@ -515,3 +515,190 @@ The native-host manifest's `path` points at the `marketplace-watcher-host` shim 
 9. **§11 (User-Agent), §12 (log rotation), §14 (last-evaluation surface)** as polish.
 
 §1 is the largest single piece; everything from §2 onward is hours, not days.
+
+---
+
+## Feature plan — Evaluation profiles (post-v0.1.x)
+
+A user-defined library of named criteria blocks ("Small mountain bikes", "Vintage receivers", etc.) that can be attached per-listing so Claude's verdict accounts for fit, not just market price. Without this, a hardtail mountain bike at 50% below market is "steal" even though the user only wants full-suspension; with the profile attached, the same listing caps at "fair" because criteria override price.
+
+### Decisions (locked with user before this section was written)
+
+- **Criteria strictness — hard cap.** A listing that violates an explicit profile criterion cannot be rated "good" or "steal" regardless of price. Best case "fair" if priced well, "skip" otherwise. The whole point of profiles is to surface fit-mismatches the price wouldn't catch.
+- **Bulk-apply UX — two affordances.** A "New selections default to: [profile]" picker in the FAB row sets the default for newly-toggled-in cards. A "Set all selected to: [profile]" control retroactively changes already-selected cards. Distinct intents, distinct controls.
+- **Re-evaluate flow — profile picker included.** The right-click "Re-evaluate" modal gains a profile select so the obvious "I picked the wrong one, redo this one" loop is closed in the same release.
+
+### Data model
+
+```js
+{ id: string /* uuid */, name: string, prompt: string }
+```
+
+`id` is stable; `name` is the displayed label; `prompt` is the criteria text that gets injected into the user prompt. Cap `prompt` at 2000 chars (same cap as scraped description) so a single profile can't inflate the per-listing payload past the 1 MB native-messaging ceiling. No timestamps, no `is_default` flag — keep it minimal.
+
+### Storage
+
+Single key `profiles: Profile[]` in `chrome.storage.local`. Order in the array determines display order. Expected ceiling is dozens, not hundreds, so a single key is fine.
+
+### Settings UI (Preferences page)
+
+New "Evaluation profiles" section between the cost-parameter fields and the Advanced disclosure.
+
+- One row per profile: `<input>` for name (full width, top), `<textarea rows=4>` for prompt (below), Delete button (right corner). Inline edit — no modal.
+- "Add profile" button appends a blank row.
+- Saves go through the existing single Save button. Validation at save time: trim, reject any row with an empty name, an empty prompt, or a name that duplicates another row's name. Show the offending row's error inline. Don't lose user input on validation failure.
+
+**Multi-tab concurrency.** `chrome.storage.local` does not serialize multi-tab writes — two open Settings pages racing would last-write-wins silently. Subscribe to `chrome.storage.onChanged` for the `profiles` key in `options.js`; if it changes externally *while the user has unsaved edits*, show a non-destructive banner ("Profiles changed in another tab — refresh to reload?") with a refresh button. No version field, no merge — the user picks which copy wins.
+
+### Per-card UX
+
+**Why not a native `<select>`.** `attachOverlays` (`extension/content/search.js:148`) removes children whose card wrapper FB recycled. A mid-open native select gets ripped out with its dropdown still rendered, leaking a phantom dropdown layer until the user clicks elsewhere. Plus native selects on Firefox tend to look out of place on FB's UI.
+
+**Build instead:** a small custom control we own the lifecycle of.
+
+- A button-style affordance in the same corner the checkbox occupied. Label = current selection (`Skip` / `Default` / profile name, ellipsized to fit).
+- Click opens a popover anchored to the button. Popover lists the same options as a native select would (`Skip`, `Evaluate (default)`, separator, each profile by name).
+- We control open/close: clicking outside closes; selecting closes; if the card wrapper is recycled mid-open we tear down our own popover instead of letting FB strand it.
+
+Options in order:
+1. **Skip** (default, value: exclude from batch)
+2. **Evaluate (default)** (value: include, no profile)
+3. *— visual separator —*
+4. Each profile by `name`
+
+Picking anything other than Skip puts the card in the batch with the corresponding profile prompt (or none) attached. The control remains visible alongside the verdict badge after a card is evaluated, so the user can change profile and re-evaluate without going through the right-click modal.
+
+When the user has zero profiles defined, the control still shows but only offers `Skip` and `Evaluate (default)` — the feature is fully additive; nothing changes for users who don't define profiles.
+
+**Keyboard.** The control is a real `<button>` (focusable, `Enter`/`Space` opens the popover). Popover items are `<button>`s; `Esc` closes. Don't trap the user inside the popover — `Tab` exits it.
+
+### Bulk-apply controls (in the FAB row)
+
+Two `<select>` controls inserted between FAB and Set Location:
+
+- **"New selections: [profile ▾]"** — when the user switches a card from Skip to anything else, it defaults to whatever this picker is set to. Doesn't touch already-set cards.
+- **"Set selected: [profile ▾]"** — explicit override that sweeps all currently-non-Skip cards to the chosen profile. Confirmation toast since this is a destructive change to user state.
+
+When `profiles.length === 0`, both controls hide themselves so the FAB row doesn't look broken on a fresh install.
+
+### Native-messaging protocol changes
+
+One new optional per-listing field in the `evaluate` envelope — namespaced as an object so a wire-protocol reader doesn't have to guess what `profile_name` is the name *of*:
+
+```json
+{
+  "type": "evaluate",
+  "listings": [{
+    "id": "1234567890",
+    "title": "...",
+    "...": "...",
+    "profile": {
+      "name": "Small mountain bikes",
+      "prompt": "The listing should outline or indicate that the bike is a small adult frame size and also be functional. In addition, it should be full suspension."
+    }
+  }]
+}
+```
+
+The `profile` field is optional — omit it entirely when no profile is attached (don't send `"profile": null`). Host treats this as a purely additive change — **no `SCHEMA_VERSION` bump**, because old extensions sending without the field keep working, and an old host receiving the field ignores unknown keys. A bump would force every user to repair through the schema-mismatch path for a backwards-compat extension.
+
+**Host-side validation (load-bearing — the doc previously got this wrong).** Clamp + validate must live in `_handle_evaluate` (`marketplace_watcher/host.py:153`), in the same per-listing loop that validates `id`, BEFORE `evaluate_parallel_streaming` runs. Specifically: if `profile` is present, require it to be an object with string `name` and string `prompt` (`ERR_INVALID_PAYLOAD` otherwise); truncate `prompt` to 2000 chars in-place; truncate `name` to 200 chars in-place. Doing the clamp inside `build_user_prompt` instead would let a buggy extension ship a 900 KB profile through the 1 MB envelope ceiling and into Claude's context — defense in depth has to be at the boundary, not deeper.
+
+### System prompt change
+
+Append a new paragraph after the `<user_notes>` rules in `SYSTEM_PROMPT_TEMPLATE`:
+
+> If a `<criteria>` element is present inside a listing, treat it as the user's first-party fit requirements (model preferences, must-have features, condition floor). The criteria are authoritative over market price: a listing that **clearly** violates a stated criterion CANNOT be rated "good" or "steal" — at best "fair" if priced well, "skip" if not. If the listing's text or photos don't provide enough information to determine whether a criterion is met, do NOT cap the verdict on that basis — judge the listing on its price evidence and note the uncertainty in the reason (e.g. "can't confirm full-suspension from listing"). When criteria materially shape the verdict, name the specific criterion in the reason (e.g. "hardtail; doesn't meet full-suspension requirement"). Criteria do not override "skip" — a listing that meets every criterion but is still overpriced or suspicious is still "skip".
+
+The "clearly violates" wording is load-bearing. An earlier draft of this rule combined the hard-cap with a "downgrade one level on uncertainty" clause; together they made every ambiguous listing collapse to "skip," which destroys the feature for value-laden criteria like "good condition." Cap on **confirmed violation only**; note the uncertainty in the reason and let price drive the verdict otherwise.
+
+`build_user_prompt` injects the profile prompt as:
+
+```xml
+<criteria>{profile.prompt}</criteria>
+```
+
+parallel to `<user_notes>`, between `<user_notes>` and `<photos>`.
+
+### Verdict cache shape
+
+Each cached verdict gains an optional `profile_name` field — the *name* at evaluation time, snapshotted, not the id. Deleting or renaming a profile post-evaluation doesn't orphan cached verdicts. **Field is omitted when no profile was applied** (don't write `profile_name: null`):
+
+```js
+{ id, verdict, reason, ..., profile_name: "Small mountain bikes" /* OR field absent */ }
+```
+
+`profile_name` is the right naming choice at this layer (vs. the wire's `profile.name`) because the verdict object is clearly an evaluation context — there's no ambiguity about whose name it is.
+
+**Badge surfaces the profile.** Tooltip alone is insufficient because the badge renders identically regardless of profile, so a page with mixed-profile verdicts looks uniform when it isn't. Render the badge as 2-line when `profile_name` is set: verdict word on top in the existing weight, profile name on a second line in smaller caps (e.g. ~10px, opacity 0.8). When `profile_name` is absent, badge stays 1-line as today. Tooltip's first line still echoes `EVALUATED AS: {profile_name}` for screen readers and for verdicts where the name was truncated in the badge.
+
+Verdicts evaluated under different profiles for the same listing overwrite the cache — there's no per-profile verdict history (out of scope; would multiply storage churn and confuse the dropdown's "current state").
+
+### Re-evaluate flow
+
+The right-click "Re-evaluate" modal gains a profile picker at the top (same custom button + popover control as the per-card UX). Default selection precedence:
+
+1. The cached `verdict.profile_name` for this listing, if present.
+2. Otherwise, the FAB row's "New selections" picker value.
+3. Otherwise, "Default (no profile)."
+
+The existing "Include photos" checkbox is unchanged. Submitting re-runs with the chosen profile and overwrites the cached verdict.
+
+### Caching collision
+
+If two batches of the same listing land under different profiles in quick succession (race condition: user changes profile mid-batch, kicks off another batch), the second-finishing one wins the cache slot. Acceptable — `evaluatedAt` ordering breaks any tie on display.
+
+### Edge cases
+
+- **Empty profiles array** — feature is invisible. Card-level control offers only Skip + Default. FAB-row controls hide.
+- **Profile deleted while in flight** — the batch already snapshotted `profile.prompt` and `profile.name` in the envelope; verdict is cached with `profile_name`. Badge + tooltip show the now-dead name; safe.
+- **Profile renamed mid-batch** — same as delete-mid-batch: snapshot wins. Re-evaluating updates the cache to the new name.
+- **Two profiles same name** — rejected at save time with an inline error on the offending row. The id is still the underlying source of truth, but identical display names confuse the dropdown and the badge, and there's no good auto-resolution.
+- **Very long profile prompt** — 2000-char cap is enforced at three points: textarea `maxlength` with a `X / 2000 chars` counter (UX), host-side clamp in `_handle_evaluate` (defense in depth), and unwritten in `build_user_prompt` (which trusts the boundary). 2000 chars is "enough room for a paragraph of criteria without bloating a 20-listing batch past sensible context"; not driven by the 1 MB native-messaging ceiling (we're nowhere near it).
+
+### Migration
+
+Zero. No new required fields anywhere. Existing storage has no `profiles` key (treated as `[]`). Existing verdicts have no `profile_name` (tooltip just omits the line).
+
+### Out of scope (v1 of profiles)
+
+- Filtering by profile in the Filter popover.
+- Per-profile cost-parameter overrides (e.g. different hourly_rate for boat shopping).
+- Sharing/exporting profiles between users.
+- Profile-specific system-prompt rules (today's prompt change is global).
+- "Default profile" auto-applied to all new selections without a picker — the user picks per intent.
+
+### Implementation order
+
+The earlier draft of this section overstated how independent the pieces are. The dependency reality:
+
+1. **Storage + Settings UI** — add the `profiles` key, build the inline-edit list in `options.html`/`options.js`, wire `chrome.storage.onChanged` for the multi-tab banner. Genuinely independent — ships and is testable without touching the eval path; user can author profiles even though nothing consumes them yet.
+2. **Envelope + host plumbing + system prompt** — must land as one PR because they're mutually dependent:
+   - Extend `runEvaluateBatch` envelope construction in `extension/background.js` and `extension/native_messaging.js` to include the per-listing `profile` object when a profile is attached.
+   - Validate + clamp the `profile` field in `_handle_evaluate` (`marketplace_watcher/host.py:153`).
+   - Extend `build_user_prompt` (`marketplace_watcher/claude_runner.py:86`) to render `<criteria>` when the listing has a `profile_prompt`.
+   - Update `SYSTEM_PROMPT_TEMPLATE` with the new paragraph.
+   - Add Python tests for: `build_user_prompt` emits `<criteria>` only when set; host clamps oversized `profile.prompt`; host rejects malformed `profile` (non-object, missing fields).
+   - At this point no extension UI surfaces the new path — eval still works exactly as today.
+3. **Per-card control + selection-state refactor** — replace `attachCheckbox` with the new button-+-popover control. Refactor internal selection state from `Set<listingId>` (`selectedIds`) to `Map<listingId, {profileId | "default"}>`, audit the five call sites (`search.js:243,257,259,263,439`). FAB count derives from the map size. **This step is what makes the feature visible to the user.**
+4. **Bulk-apply controls** — two custom-popover controls in the FAB row (matching the per-card aesthetic), both gated on `profiles.length > 0`. Confirmation toast on "Set selected to: …".
+5. **Verdict cache shape + 2-line badge** — write `profile_name` into the verdict entry in `background.js`, render the 2-line badge in `attachBadge` when present, update the tooltip's first line.
+6. **Re-evaluate modal** — add the profile picker, implement the default-precedence rule, wire submission.
+
+Step 1 ships independently; steps 2–6 land in roughly this order but each one builds on the previous. Step 2 *can* technically ship without UI (just envelope plumbing + tests), and doing so first means we have integration confidence before reworking `search.js`.
+
+### What's load-bearing vs. bikeshed-able
+
+**Load-bearing** (get wrong and the feature doesn't work):
+- Per-listing `profile` object in the envelope (mixed-profile batches require this).
+- Hard-cap rule keyed on **confirmed** violation only — combining cap with uncertainty-downgrade collapses ambiguous listings to "skip" and destroys the feature.
+- Snapshot-name caching (delete-while-cached must not orphan).
+- Host-side clamp lives in `_handle_evaluate`, not `build_user_prompt`.
+- 2-line badge for profile-evaluated verdicts (without it, mixed-profile pages look uniform and the user's mental model breaks).
+
+**Bikeshed-able** (refinable post-launch without breaking anything):
+- The exact look of the custom button + popover (size, colors, animation).
+- Where the bulk-apply controls live in the FAB row.
+- The exact text of the system-prompt addition.
+- The 2000-char cap (could be tuned).
+- The multi-tab banner copy.
