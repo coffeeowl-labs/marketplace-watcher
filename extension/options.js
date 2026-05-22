@@ -26,16 +26,33 @@ const els = {
   pillHelper: $("status-helper"),
   pillClaude: $("status-claude"),
   pillLast: $("status-last"),
+  profilesList: $("profiles-list"),
+  addProfileBtn: $("add-profile-btn"),
+  profilesChangedBanner: $("profiles-changed-banner"),
+  profilesReloadBtn: $("profiles-reload-btn"),
 };
 
 const DEFAULTS = { hourly_rate: 20, gas_per_gallon: 5, mpg: 25 };
+
+const PROFILE_NAME_MAX = 200;
+const PROFILE_PROMPT_MAX = 2000;
+
+// In-memory state. profilesAtLoad is a deep-cloned snapshot of what's in
+// storage so we can detect (a) "is the user dirty?" and (b) "did another
+// tab clobber us?" without round-tripping to storage.
+let profilesState = [];
+let profilesAtLoad = [];
 
 let statusPort = null;
 
 async function loadInitial() {
   const data = await chrome.storage.local.get([
-    "user_location", "cost_params", "debug_logging",
+    "user_location", "cost_params", "debug_logging", "profiles",
   ]);
+
+  profilesState = Array.isArray(data.profiles) ? cloneProfiles(data.profiles) : [];
+  profilesAtLoad = cloneProfiles(profilesState);
+  renderProfiles();
 
   const loc = data.user_location;
   if (loc && loc.raw) {
@@ -61,7 +78,187 @@ function parseField(input, fallback) {
   return Number.isFinite(v) && v >= 0 ? v : fallback;
 }
 
+// --- Profiles -------------------------------------------------------------
+
+function cloneProfiles(arr) {
+  return arr.map((p) => ({ id: p.id, name: p.name, prompt: p.prompt }));
+}
+
+function profilesEqual(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].id !== b[i].id || a[i].name !== b[i].name || a[i].prompt !== b[i].prompt) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isDirty() {
+  return !profilesEqual(profilesState, profilesAtLoad);
+}
+
+function newProfileId() {
+  // crypto.randomUUID is available in extension contexts on modern Firefox.
+  return crypto.randomUUID();
+}
+
+function renderProfiles() {
+  els.profilesList.replaceChildren();
+  for (const profile of profilesState) {
+    els.profilesList.appendChild(buildProfileRow(profile));
+  }
+}
+
+function buildProfileRow(profile) {
+  const row = document.createElement("div");
+  row.className = "profile-row";
+  row.dataset.profileId = profile.id;
+
+  const head = document.createElement("div");
+  head.className = "profile-row-head";
+
+  const nameInput = document.createElement("input");
+  nameInput.type = "text";
+  nameInput.value = profile.name;
+  nameInput.placeholder = "Profile name (e.g. Small mountain bikes)";
+  nameInput.maxLength = PROFILE_NAME_MAX;
+  nameInput.addEventListener("input", () => {
+    profile.name = nameInput.value;
+    row.classList.remove("invalid");
+    setRowError(row, "");
+  });
+
+  const delBtn = document.createElement("button");
+  delBtn.type = "button";
+  delBtn.className = "profile-delete";
+  delBtn.textContent = "Delete";
+  delBtn.addEventListener("click", () => deleteProfile(profile.id));
+
+  head.append(nameInput, delBtn);
+
+  const ta = document.createElement("textarea");
+  ta.value = profile.prompt;
+  ta.placeholder = "Criteria text. Claude treats clearly-violated criteria as a hard cap on the verdict.";
+  ta.rows = 4;
+  ta.maxLength = PROFILE_PROMPT_MAX;
+  ta.addEventListener("input", () => {
+    profile.prompt = ta.value;
+    updateRowFooter(row, profile);
+    row.classList.remove("invalid");
+    setRowError(row, "");
+  });
+
+  const foot = document.createElement("div");
+  foot.className = "profile-row-foot";
+  const err = document.createElement("span");
+  err.className = "profile-row-err";
+  const counter = document.createElement("span");
+  counter.className = "profile-row-count";
+  foot.append(err, counter);
+
+  row.append(head, ta, foot);
+  updateRowFooter(row, profile);
+  return row;
+}
+
+function updateRowFooter(row, profile) {
+  const counter = row.querySelector(".profile-row-count");
+  if (counter) counter.textContent = `${profile.prompt.length} / ${PROFILE_PROMPT_MAX}`;
+}
+
+function setRowError(row, msg) {
+  const err = row.querySelector(".profile-row-err");
+  if (err) err.textContent = msg;
+}
+
+function addProfile() {
+  profilesState.push({ id: newProfileId(), name: "", prompt: "" });
+  renderProfiles();
+  // Focus the new row's name input for an "and start typing" flow.
+  const rows = els.profilesList.querySelectorAll(".profile-row");
+  const last = rows[rows.length - 1];
+  if (last) last.querySelector("input[type=text]").focus();
+}
+
+function deleteProfile(id) {
+  profilesState = profilesState.filter((p) => p.id !== id);
+  renderProfiles();
+}
+
+function validateProfiles() {
+  // Returns { ok: true, profiles: [...] } on success, { ok: false, errors }
+  // where errors is a Map<profileId, message>. We populate `profiles` with
+  // trimmed values so callers don't have to re-trim on save.
+  const errors = new Map();
+  const trimmed = profilesState.map((p) => ({
+    id: p.id,
+    name: p.name.trim(),
+    prompt: p.prompt.trim(),
+  }));
+
+  for (const p of trimmed) {
+    if (!p.name) errors.set(p.id, "Name is required.");
+    else if (!p.prompt) errors.set(p.id, "Criteria text is required.");
+  }
+
+  // Duplicate-name check (case-insensitive — "Small MTB" and "small mtb"
+  // would confuse the dropdown). Only flag the duplicates that aren't
+  // already errored for emptiness.
+  const seen = new Map();
+  for (const p of trimmed) {
+    if (errors.has(p.id)) continue;
+    const key = p.name.toLowerCase();
+    if (seen.has(key)) {
+      errors.set(p.id, "Duplicate name — must be unique.");
+      const firstId = seen.get(key);
+      if (!errors.has(firstId)) {
+        errors.set(firstId, "Duplicate name — must be unique.");
+      }
+    } else {
+      seen.set(key, p.id);
+    }
+  }
+
+  if (errors.size > 0) return { ok: false, errors };
+  return { ok: true, profiles: trimmed };
+}
+
+function showValidationErrors(errors) {
+  for (const row of els.profilesList.querySelectorAll(".profile-row")) {
+    const id = row.dataset.profileId;
+    const msg = errors.get(id);
+    if (msg) {
+      row.classList.add("invalid");
+      setRowError(row, msg);
+    } else {
+      row.classList.remove("invalid");
+      setRowError(row, "");
+    }
+  }
+}
+
+function reloadProfilesFromStorage() {
+  chrome.storage.local.get("profiles").then((data) => {
+    profilesState = Array.isArray(data.profiles) ? cloneProfiles(data.profiles) : [];
+    profilesAtLoad = cloneProfiles(profilesState);
+    renderProfiles();
+    els.profilesChangedBanner.hidden = true;
+  });
+}
+
 async function saveAll() {
+  // Validate profiles FIRST so a profile error blocks all writes. The earlier
+  // pattern of "save cost_params, then handle address" leaves you with
+  // partial saves on failure; we don't want a third partial-failure mode.
+  const profileResult = validateProfiles();
+  if (!profileResult.ok) {
+    showValidationErrors(profileResult.errors);
+    els.saveStatus.textContent = "Fix profile errors and try again.";
+    els.saveStatus.className = "err";
+    return;
+  }
+
   els.saveStatus.textContent = "Saving…";
   els.saveStatus.className = "";
   els.saveBtn.disabled = true;
@@ -74,7 +271,14 @@ async function saveAll() {
     await chrome.storage.local.set({
       cost_params: costParams,
       debug_logging: els.debug.checked,
+      profiles: profileResult.profiles,
     });
+    // Adopt trimmed values into in-memory state so isDirty() returns false
+    // after a clean save (Save → another tab edits → banner should NOT
+    // fire if the user has no unsaved edits).
+    profilesState = cloneProfiles(profileResult.profiles);
+    profilesAtLoad = cloneProfiles(profilesState);
+    renderProfiles();
 
     const addressInput = els.address.value.trim();
     const stored = (await chrome.storage.local.get("user_location")).user_location;
@@ -243,9 +447,29 @@ document.addEventListener("DOMContentLoaded", () => {
   els.address.addEventListener("input", () => {
     if (els.address.value.trim()) els.banner.hidden = true;
   });
+  els.addProfileBtn.addEventListener("click", addProfile);
+  els.profilesReloadBtn.addEventListener("click", reloadProfilesFromStorage);
   chrome.storage.onChanged.addListener((changes, area) => {
-    if (area === "local" && changes.last_evaluation) {
+    if (area !== "local") return;
+    if (changes.last_evaluation) {
       refreshLastPill().catch(() => {});
+    }
+    if (changes.profiles) {
+      const next = Array.isArray(changes.profiles.newValue)
+        ? changes.profiles.newValue : [];
+      // Distinguish our own writes from external (other-tab) writes by
+      // comparing to in-memory state. Our saveAll always lands with
+      // profilesState already === the value we wrote, so this is a no-op
+      // for self-writes.
+      if (profilesEqual(next, profilesState)) return;
+      if (isDirty()) {
+        // Don't clobber unsaved edits silently — surface the conflict.
+        els.profilesChangedBanner.hidden = false;
+      } else {
+        profilesState = cloneProfiles(next);
+        profilesAtLoad = cloneProfiles(next);
+        renderProfiles();
+      }
     }
   });
   openStatus();

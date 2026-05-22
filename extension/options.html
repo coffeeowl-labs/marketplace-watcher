@@ -44,6 +44,22 @@
     </div>
   </section>
 
+  <section class="field-section">
+    <label>Evaluation profiles</label>
+    <div class="help">
+      Pre-defined criteria blocks you can attach to a listing at evaluate
+      time. Each profile pushes Claude to weigh fit (e.g. "must be full
+      suspension") alongside price.
+    </div>
+    <div id="profiles-changed-banner" class="banner-warn" hidden>
+      Profiles were changed in another tab. Your unsaved edits would
+      overwrite them.
+      <button id="profiles-reload-btn" type="button">Reload from storage</button>
+    </div>
+    <div id="profiles-list"></div>
+    <button id="add-profile-btn" type="button" class="ghost-btn">+ Add profile</button>
+  </section>
+
   <section class="actions">
     <button id="save-btn" type="button">Save</button>
     <span id="save-status" aria-live="polite"></span>
