@@ -5,10 +5,12 @@
 const HARD_CAP = 20;
 const SOFT_FLOOR = 5;
 
-// Per-listing selection. Absence = "Skip" (not in batch). "default" =
+// Per-listing selection. Absence = "None" (not in batch). "default" =
 // in batch with no profile attached. Any other string = profile id from
 // chrome.storage's `profiles` array. Replaces the v0 selectedIds Set;
-// the per-card picker drives this.
+// the per-card picker drives this. (The picker's "not in batch" option
+// is labeled "None" rather than "Skip" because Skip is also a verdict
+// state — colliding labels confused users in step-3 QA.)
 const selections = new Map(); // listingId -> "default" | profileId
 let cachedVerdicts = {}; // id -> verdict object
 let cachedContexts = {}; // id -> user-provided context string
@@ -321,7 +323,7 @@ function updatePickerLabel(btn, id) {
   const labelEl = btn.querySelector(".mw-picker-label");
   btn.classList.remove("mw-picker-active", "mw-picker-profile");
   if (!sel) {
-    labelEl.textContent = "Skip";
+    labelEl.textContent = "None";
     btn.title = "Click to add this listing to the batch.";
     return;
   }
@@ -365,7 +367,7 @@ function togglePicker(card, id, btn) {
     opt.textContent = displayLabel;
     opt.setAttribute("role", "menuitem");
     const isCurrent =
-      (val === "skip" && currentSel === undefined) || val === currentSel;
+      (val === "none" && currentSel === undefined) || val === currentSel;
     if (isCurrent) opt.classList.add("mw-picker-option-current");
     opt.addEventListener("mousedown", (e) => e.stopPropagation());
     opt.addEventListener("click", (e) => {
@@ -376,7 +378,7 @@ function togglePicker(card, id, btn) {
     popover.appendChild(opt);
   };
 
-  addOption("skip", "Skip");
+  addOption("none", "None");
   addOption("default", "Evaluate (default)");
   if (currentProfiles.length > 0) {
     const divider = document.createElement("div");
@@ -406,7 +408,7 @@ function closeOpenPicker() {
 }
 
 function handlePickerSelection(id, val) {
-  if (val === "skip") {
+  if (val === "none") {
     selections.delete(id);
   } else {
     // Cap applies only when ADDING (changing an already-selected card's
@@ -430,7 +432,7 @@ function handlePickerSelection(id, val) {
   // re-runs this listing. Scraped data (the expensive part) is in a
   // separate cache key and is preserved.
   const hadVerdict = !!cachedVerdicts[id];
-  if (hadVerdict && val !== "skip") {
+  if (hadVerdict && val !== "none") {
     delete cachedVerdicts[id];
     chrome.storage.local.remove(`verdict:${id}`).catch(() => {});
     const card = document.querySelector(`[data-mw-card="${id}"]`);
@@ -1002,7 +1004,7 @@ function onVerdictStreamed(verdict, done, total) {
     card.querySelectorAll(".mw-badge").forEach((n) => n.remove());
     attachBadge(card, verdict);
     // Picker label tracks `selections`, which we just deleted from, so
-    // it'll show "Skip" again. Refresh it to reflect that.
+    // it'll show "None" again. Refresh it to reflect that.
     const btn = card.querySelector(".mw-picker");
     if (btn) updatePickerLabel(btn, verdict.id);
   }
