@@ -19,24 +19,52 @@ You need [Claude CLI][claude] installed and authenticated, plus
 [`uv`][uv] (or any Python 3.11+ environment that can run console-script
 entrypoints).
 
+### Linux / macOS
+
 ```sh
 # 1. Install the helper (one-time):
 uv tool install git+https://github.com/coffeeowl-labs/marketplace-watcher
 marketplace-watcher install
 ```
 
-`install` detects every Gecko-based browser on the system (stock Firefox,
-Zen, LibreWolf, Waterfox, Floorp; plus Snap and Flatpak Firefox; plus
-Flatpak Zen) and writes the native-messaging-host manifest to each
-applicable directory. It also verifies that the Claude CLI is on `PATH`
-and records its absolute path so the host process can find it later, even
+### Windows
+
+```powershell
+# 1. Install uv if you don't have it:
+winget install --id=astral-sh.uv
+
+# 2. Install the helper:
+uv tool install git+https://github.com/coffeeowl-labs/marketplace-watcher
+
+# 3. IMPORTANT: refresh PATH so the new shim is findable, then open a
+#    new PowerShell window before continuing. `marketplace-watcher` and
+#    `claude` both need to be on PATH for the next step.
+uv tool update-shell
+
+# 4. In the NEW terminal window:
+marketplace-watcher install
+```
+
+If step 4 errors with "Claude CLI not found on PATH" or "host shim not
+found", you skipped step 3 or are still in the original terminal window
+— open a fresh PowerShell and rerun step 4.
+
+### What `install` does
+
+It detects every Gecko-based browser on the system (stock Firefox, Zen,
+LibreWolf, Waterfox, Floorp; plus Snap and Flatpak Firefox; plus Flatpak
+Zen on Linux) and writes the native-messaging-host manifest to each
+applicable location — a JSON file under `~/.mozilla/native-messaging-hosts/`
+on Linux/macOS, an `HKCU\Software\Mozilla\NativeMessagingHosts\` registry
+key on Windows. It also verifies that the Claude CLI is on `PATH` and
+records its absolute path so the host process can find it later, even
 when launched by a GUI-shortcut Firefox that doesn't inherit your shell's
 `PATH`.
 
-```sh
-# 2. Install the signed extension. Open this URL in Firefox / Zen:
-#    https://github.com/coffeeowl-labs/marketplace-watcher/releases/download/v0.1.0/marketplace-watcher-0.1.0.xpi
-```
+### Install the signed extension
+
+Open this URL in Firefox / Zen:
+<https://github.com/coffeeowl-labs/marketplace-watcher/releases/download/v0.1.0/marketplace-watcher-0.1.0.xpi>
 
 Firefox will prompt for permission to install. The extension is signed by
 Mozilla via AMO (unlisted), so it persists across browser restarts.

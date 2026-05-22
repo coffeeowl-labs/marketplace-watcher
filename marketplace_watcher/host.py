@@ -48,7 +48,20 @@ _shutdown = threading.Event()
 
 def _open_binary_stdio():
     """Make stdin/stdout binary + unbuffered. Length-prefix framing must not
-    pass through text-mode line-ending munging or stdio block buffering."""
+    pass through text-mode line-ending munging or stdio block buffering.
+
+    On Windows the underlying file descriptors default to text mode in the
+    C runtime, and os.fdopen("rb"/"wb") wraps them in a Python-level binary
+    object but does NOT change the FD's translation bit — every \\n written
+    through fd 1 still gets expanded to \\r\\n on the wire, which corrupts
+    the 4-byte length prefix and every JSON payload. msvcrt.setmode flips
+    the FD itself to O_BINARY before we open it; this must run before any
+    read or write touches fd 0 or 1.
+    """
+    if sys.platform == "win32":
+        import msvcrt
+        msvcrt.setmode(0, os.O_BINARY)
+        msvcrt.setmode(1, os.O_BINARY)
     sys.stdin = os.fdopen(0, "rb", buffering=0)
     sys.stdout = os.fdopen(1, "wb", buffering=0)
 

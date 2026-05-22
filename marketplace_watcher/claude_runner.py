@@ -14,6 +14,7 @@ import os
 import queue
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -29,6 +30,13 @@ DESCRIPTION_CHAR_CAP = 2000
 # completes in ~30–60 s on Sonnet, claude CLI startup (~3–5 s) is amortized,
 # and a 20-batch fans out to 4 concurrent processes.
 CHUNK_SIZE = 5
+
+# Windows-only: prevent every claude.cmd invocation from flashing a cmd.exe
+# console window. The host runs detached from any terminal under Firefox,
+# so without this the user would see N popup windows per batch.
+_SUBPROCESS_CREATIONFLAGS = (
+    subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+)
 
 
 @dataclass(frozen=True)
@@ -207,6 +215,7 @@ def _run_chunk(chunk: list[dict], claude_path: str, cost: CostParams) -> _ChunkR
                     text=True,
                     timeout=CLAUDE_TIMEOUT_SECONDS,
                     env=scrubbed_env(),
+                    creationflags=_SUBPROCESS_CREATIONFLAGS,
                 )
             except subprocess.TimeoutExpired:
                 helper_log("claude_call_end", level="error", reason="timeout",
