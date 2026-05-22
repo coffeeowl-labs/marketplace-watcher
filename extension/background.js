@@ -179,7 +179,12 @@ const inFlightEvaluates = new Map(); // tabId -> AbortController
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "evaluate") {
-    handleEvaluate(msg.listingIds, sender.tab.id, msg.options || {})
+    handleEvaluate(
+      msg.listingIds,
+      sender.tab.id,
+      msg.options || {},
+      msg.profileByListingId || {},
+    )
       .then(sendResponse)
       .catch((e) => sendResponse({ error: e.message }));
     return true; // async response
@@ -352,7 +357,7 @@ async function checkHelperHealth() {
   return result.claude_cli && result.claude_cli.status === "ok";
 }
 
-async function handleEvaluate(listingIds, sourceTabId, options = {}) {
+async function handleEvaluate(listingIds, sourceTabId, options = {}, profileByListingId = {}) {
   const includeImages = !!options.includeImages;
 
   // Replace any prior in-flight controller for this tab — re-clicking
@@ -365,7 +370,7 @@ async function handleEvaluate(listingIds, sourceTabId, options = {}) {
   inFlightEvaluates.set(sourceTabId, ac);
 
   try {
-    return await runEvaluatePhases(listingIds, sourceTabId, options, ac.signal);
+    return await runEvaluatePhases(listingIds, sourceTabId, options, ac.signal, profileByListingId);
   } finally {
     if (inFlightEvaluates.get(sourceTabId) === ac) {
       inFlightEvaluates.delete(sourceTabId);
@@ -373,7 +378,7 @@ async function handleEvaluate(listingIds, sourceTabId, options = {}) {
   }
 }
 
-async function runEvaluatePhases(listingIds, sourceTabId, options, signal) {
+async function runEvaluatePhases(listingIds, sourceTabId, options, signal, profileByListingId = {}) {
   const includeImages = !!options.includeImages;
 
   // Fail-fast: a 40-second scrape phase is wasted effort if the helper
@@ -518,6 +523,30 @@ async function runEvaluatePhases(listingIds, sourceTabId, options, signal) {
 
   let verdicts = [];
   const updates = {};
+  // Resolve profileByListingId (ids only — keeps the wire format from
+  // having to ship the prompt text from the content script) into the
+  // {name, prompt} objects the host expects per listing. Look up via
+  // chrome.storage rather than trust the content script's snapshot —
+  // user might have edited a profile in Settings between Skip→pick and
+  // Evaluate, and we want the latest text.
+  let profilesById = {};
+  if (Object.keys(profileByListingId).length > 0) {
+    const profStore = (await chrome.storage.local.get("profiles")).profiles;
+    if (Array.isArray(profStore)) {
+      for (const p of profStore) profilesById[p.id] = p;
+    }
+  }
+  for (const item of valid) {
+    const profileId = profileByListingId[item.id];
+    if (!profileId || profileId === "default") continue;
+    const profile = profilesById[profileId];
+    if (profile && profile.name && profile.prompt) {
+      // Wire shape — see DISTRIBUTION.md "Native-messaging protocol
+      // changes". Host clamps name (200) / prompt (2000) and flattens
+      // into profile_name / profile_prompt for build_user_prompt.
+      item.profile = { name: profile.name, prompt: profile.prompt };
+    }
+  }
   if (valid.length) {
     sendProgress(sourceTabId, { phase: "evaluating" });
     console.log("[mw] sending to helper:", valid.map(v => ({
@@ -538,6 +567,7 @@ async function runEvaluatePhases(listingIds, sourceTabId, options, signal) {
       verdicts = await runEvaluateBatchStreaming(valid, costParams, signal, async (v) => {
         const item = valid.find((s) => s.id === v.id);
         const imgCount = item?.images_b64 ? item.images_b64.length : 0;
+        const profileName = item?.profile?.name;
         const entry = {
           ...v,
           title: item?.title,
@@ -552,6 +582,10 @@ async function runEvaluatePhases(listingIds, sourceTabId, options, signal) {
           images_included: imgCount > 0,
           image_count: imgCount,
           evaluatedAt: Date.now(),
+          // Snapshot the profile NAME (not id) so a later profile rename
+          // or delete doesn't orphan the cached verdict. Omit the field
+          // entirely when no profile was applied — see DISTRIBUTION.md.
+          ...(profileName ? { profile_name: profileName } : {}),
         };
         updates[`verdict:${v.id}`] = entry;
         await chrome.storage.local.set({ [`verdict:${v.id}`]: entry });

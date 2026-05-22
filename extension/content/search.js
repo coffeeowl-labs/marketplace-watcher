@@ -5,9 +5,15 @@
 const HARD_CAP = 20;
 const SOFT_FLOOR = 5;
 
-const selectedIds = new Set();
+// Per-listing selection. Absence = "Skip" (not in batch). "default" =
+// in batch with no profile attached. Any other string = profile id from
+// chrome.storage's `profiles` array. Replaces the v0 selectedIds Set;
+// the per-card picker drives this.
+const selections = new Map(); // listingId -> "default" | profileId
 let cachedVerdicts = {}; // id -> verdict object
 let cachedContexts = {}; // id -> user-provided context string
+let currentProfiles = []; // [{id, name, prompt}]; mirrors chrome.storage.local.profiles
+let openPicker = null;   // { card, id, btn, popover } | null — at most one popover open
 let mutationDebounceTimer = null;
 
 // Display order of filter rows in the popover.
@@ -35,11 +41,37 @@ const filterState = {
 
 (async () => {
   ({ verdicts: cachedVerdicts, contexts: cachedContexts } = await loadCachedData());
+  await loadProfiles();
   ensureFAB();
   await loadFilterState();
   setupObserver();
   attachOverlays();
 })();
+
+async function loadProfiles() {
+  const data = await chrome.storage.local.get("profiles");
+  currentProfiles = Array.isArray(data.profiles) ? data.profiles : [];
+}
+
+// React to profile edits in the Settings tab (or another Marketplace tab)
+// without requiring a page reload. Demote selections that referenced a
+// deleted profile to "default" and repaint any visible picker labels.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local" || !changes.profiles) return;
+  const next = Array.isArray(changes.profiles.newValue) ? changes.profiles.newValue : [];
+  currentProfiles = next;
+  const liveIds = new Set(next.map((p) => p.id));
+  for (const [listingId, sel] of selections) {
+    if (sel !== "default" && !liveIds.has(sel)) {
+      selections.set(listingId, "default");
+    }
+  }
+  for (const btn of document.querySelectorAll(".mw-picker")) {
+    updatePickerLabel(btn, btn.dataset.mwId);
+  }
+  // Close any open popover — its option list is now stale.
+  closeOpenPicker();
+});
 
 async function loadFilterState() {
   const stored = await chrome.storage.local.get([
@@ -188,11 +220,18 @@ function attachOverlays() {
     const cs = getComputedStyle(card);
     if (cs.position === "static") card.style.position = "relative";
 
+    // Picker is always attached so users can change/re-evaluate even
+    // after a verdict lands. Badge attaches on top when a verdict exists.
+    attachPicker(card, id);
     if (cachedVerdicts[id]) {
       attachBadge(card, cachedVerdicts[id]);
-    } else {
-      attachCheckbox(card, id);
     }
+  }
+  // If FB recycled the card the open popover is anchored to, close it —
+  // otherwise we leak a phantom dropdown layer.
+  if (openPicker) {
+    const stillThere = document.querySelector(`[data-mw-card="${openPicker.id}"]`);
+    if (stillThere !== openPicker.card) closeOpenPicker();
   }
   markSponsoredCards();
 }
@@ -234,49 +273,201 @@ function markSponsoredCards() {
   }
 }
 
-function attachCheckbox(card, id) {
-  const box = document.createElement("div");
-  box.className = "mw-checkbox";
-  box.dataset.mwId = id;
-  box.textContent = "";
-  const apply = () => {
-    if (selectedIds.has(id)) {
-      box.classList.add("mw-checked");
-      box.textContent = "✓";
-    } else {
-      box.classList.remove("mw-checked");
-      box.textContent = "";
-    }
-  };
-  box.addEventListener(
-    "click",
-    (e) => {
+// --- Per-card profile picker ----------------------------------------------
+//
+// Replaces the v0 checkbox. A custom button + popover (not a native
+// <select>) because FB virtualizes its card list — a mid-open native
+// select gets ripped out of the DOM with its dropdown still rendered,
+// leaking a phantom layer. With our own popover we tear it down when
+// the anchor card disappears (see attachOverlays above).
+
+function attachPicker(card, id) {
+  // attachOverlays may run more than once on the same card (mutations);
+  // don't duplicate the picker.
+  if (card.querySelector(".mw-picker")) {
+    updatePickerLabel(card.querySelector(".mw-picker"), id);
+    return;
+  }
+
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "mw-picker";
+  btn.dataset.mwId = id;
+  btn.setAttribute("aria-haspopup", "true");
+  btn.setAttribute("aria-expanded", "false");
+
+  const label = document.createElement("span");
+  label.className = "mw-picker-label";
+  const caret = document.createElement("span");
+  caret.className = "mw-picker-caret";
+  caret.textContent = "▾";
+  btn.append(label, caret);
+
+  // Block clicks from bubbling to the card link.
+  btn.addEventListener("mousedown", (e) => e.stopPropagation());
+  btn.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    togglePicker(card, id, btn);
+  });
+
+  card.dataset.mwState ||= "unanalyzed";
+  card.appendChild(btn);
+  updatePickerLabel(btn, id);
+}
+
+function updatePickerLabel(btn, id) {
+  const sel = selections.get(id);
+  const labelEl = btn.querySelector(".mw-picker-label");
+  btn.classList.remove("mw-picker-active", "mw-picker-profile");
+  if (!sel) {
+    labelEl.textContent = "Skip";
+    btn.title = "Click to add this listing to the batch.";
+    return;
+  }
+  btn.classList.add("mw-picker-active");
+  if (sel === "default") {
+    labelEl.textContent = "Default";
+    btn.title = "Will be evaluated without any profile criteria.";
+    return;
+  }
+  const profile = currentProfiles.find((p) => p.id === sel);
+  labelEl.textContent = profile ? profile.name : "Default";
+  if (profile) {
+    btn.classList.add("mw-picker-profile");
+    btn.title = `Will be evaluated against profile: ${profile.name}.`;
+  } else {
+    // Profile was deleted from storage while this listing was selected.
+    // Silently demote to default — the storage.onChanged handler does
+    // this for visible cards too, but a race can leave us here.
+    selections.set(id, "default");
+    btn.title = "Selected profile was removed; will use default.";
+  }
+}
+
+function togglePicker(card, id, btn) {
+  if (openPicker && openPicker.id === id) {
+    closeOpenPicker();
+    return;
+  }
+  closeOpenPicker();
+
+  const popover = document.createElement("div");
+  popover.className = "mw-picker-popover";
+  popover.setAttribute("role", "menu");
+
+  const currentSel = selections.get(id); // undefined | "default" | profileId
+  const addOption = (val, displayLabel) => {
+    const opt = document.createElement("button");
+    opt.type = "button";
+    opt.className = "mw-picker-option";
+    opt.dataset.val = val;
+    opt.textContent = displayLabel;
+    opt.setAttribute("role", "menuitem");
+    const isCurrent =
+      (val === "skip" && currentSel === undefined) || val === currentSel;
+    if (isCurrent) opt.classList.add("mw-picker-option-current");
+    opt.addEventListener("mousedown", (e) => e.stopPropagation());
+    opt.addEventListener("click", (e) => {
       e.preventDefault();
       e.stopPropagation();
-      if (selectedIds.has(id)) {
-        selectedIds.delete(id);
-      } else {
-        if (selectedIds.size >= HARD_CAP) {
-          flashFAB("max 20 selected");
-          return;
-        }
-        selectedIds.add(id);
-        // Eagerly start scraping so the data is ready (or close to it) by
-        // the time the user clicks Evaluate. Fire-and-forget; the queue
-        // dedupes against any in-flight scrape.
-        chrome.runtime
-          .sendMessage({ type: "prefetch", listingId: id })
-          .catch(() => {});
-      }
-      apply();
-      updateFAB();
-    },
-    true
-  );
-  apply();
-  card.dataset.mwState = "unanalyzed";
-  card.appendChild(box);
+      handlePickerSelection(id, val);
+    });
+    popover.appendChild(opt);
+  };
+
+  addOption("skip", "Skip");
+  addOption("default", "Evaluate (default)");
+  if (currentProfiles.length > 0) {
+    const divider = document.createElement("div");
+    divider.className = "mw-picker-divider";
+    popover.appendChild(divider);
+    for (const p of currentProfiles) addOption(p.id, p.name);
+  }
+
+  // Anchor under the button. The card already has position:relative
+  // (set in attachOverlays for any non-static card), so absolute
+  // positioning inside it is anchored correctly.
+  popover.style.position = "absolute";
+  popover.style.top = `${btn.offsetTop + btn.offsetHeight + 4}px`;
+  popover.style.left = `${btn.offsetLeft}px`;
+  card.appendChild(popover);
+  btn.setAttribute("aria-expanded", "true");
+  openPicker = { card, id, btn, popover };
 }
+
+function closeOpenPicker() {
+  if (!openPicker) return;
+  try {
+    openPicker.popover.remove();
+    openPicker.btn.setAttribute("aria-expanded", "false");
+  } catch (_) {}
+  openPicker = null;
+}
+
+function handlePickerSelection(id, val) {
+  if (val === "skip") {
+    selections.delete(id);
+  } else {
+    // Cap applies only when ADDING (changing an already-selected card's
+    // profile shouldn't bump us over the cap).
+    if (!selections.has(id) && selections.size >= HARD_CAP) {
+      flashFAB("max 20 selected");
+      closeOpenPicker();
+      return;
+    }
+    selections.set(id, val);
+    // Eagerly scrape so the data is ready by the time the user clicks
+    // Evaluate. Fire-and-forget; the queue dedupes against in-flight.
+    chrome.runtime
+      .sendMessage({ type: "prefetch", listingId: id })
+      .catch(() => {});
+  }
+
+  // If the listing already has a verdict and the user is changing the
+  // profile, treat that as "I want to redo this with the new profile" —
+  // bust the verdict cache and remove the badge so the next Evaluate
+  // re-runs this listing. Scraped data (the expensive part) is in a
+  // separate cache key and is preserved.
+  const hadVerdict = !!cachedVerdicts[id];
+  if (hadVerdict && val !== "skip") {
+    delete cachedVerdicts[id];
+    chrome.storage.local.remove(`verdict:${id}`).catch(() => {});
+    const card = document.querySelector(`[data-mw-card="${id}"]`);
+    if (card) {
+      card.querySelectorAll(".mw-badge").forEach((n) => n.remove());
+      card.dataset.mwState = "unanalyzed";
+    }
+  }
+
+  // Repaint the picker label on this card.
+  const card = document.querySelector(`[data-mw-card="${id}"]`);
+  if (card) {
+    const btn = card.querySelector(".mw-picker");
+    if (btn) updatePickerLabel(btn, id);
+  }
+  closeOpenPicker();
+  updateFAB();
+}
+
+// Document-level handlers — click-outside closes, Esc closes. Capture
+// phase so we intercept clicks on FB's own elements before they navigate.
+document.addEventListener(
+  "click",
+  (e) => {
+    if (!openPicker) return;
+    if (openPicker.popover.contains(e.target)) return;
+    if (openPicker.btn.contains(e.target)) return;
+    closeOpenPicker();
+  },
+  true
+);
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && openPicker) {
+    e.preventDefault();
+    closeOpenPicker();
+  }
+});
 
 function attachBadge(card, verdict) {
   const badge = document.createElement("div");
@@ -293,6 +484,7 @@ function attachBadge(card, verdict) {
   // Tooltip surfaces the full scraped payload alongside the verdict so
   // we can sanity-check what the model actually saw.
   const lines = [];
+  if (verdict.profile_name) lines.push(`EVALUATED AS: ${verdict.profile_name}`);
   if (verdict.reason) lines.push(`REASON: ${verdict.reason}`);
   if (verdict.error) lines.push(`ERROR: ${verdict.error}`);
   if (verdict.title) lines.push(`\nTitle: ${verdict.title}`);
@@ -457,10 +649,13 @@ async function ensureUserLocation() {
 async function onClearCacheClick() {
   const count = Object.keys(cachedVerdicts).length;
   if (!confirm(`Clear ${count} cached verdict${count === 1 ? "" : "s"}?`)) return;
+  // Re-fetch profiles AFTER the clear — we just nuked them along with
+  // everything else, which is the user's intent here.
   await chrome.storage.local.clear();
   cachedVerdicts = {};
   cachedContexts = {};
-  selectedIds.clear();
+  currentProfiles = [];
+  selections.clear();
   refreshAllOverlays();
   updateFAB();
 }
@@ -468,7 +663,7 @@ async function onClearCacheClick() {
 function updateFAB() {
   const fab = document.getElementById("mw-fab");
   if (!fab) return;
-  const n = selectedIds.size;
+  const n = selections.size;
   let label = `Evaluate (${n})`;
   if (n > 0 && n < SOFT_FLOOR) label += " — 5+ recommended";
   fab.textContent = label;
@@ -679,7 +874,16 @@ async function onEvaluateClick() {
     return;
   }
   fab.disabled = true;
-  const ids = Array.from(selectedIds);
+  const ids = Array.from(selections.keys());
+  // Build the per-listing profile mapping the background needs to attach
+  // profile.{name,prompt} to each listing in the wire envelope. Skip
+  // ("not in batch") never gets here because those ids aren't in
+  // selections. "default" means "in batch, no profile" — omit from the
+  // map so background sees no entry and doesn't attach a profile.
+  const profileByListingId = {};
+  for (const [listingId, sel] of selections) {
+    if (sel && sel !== "default") profileByListingId[listingId] = sel;
+  }
   fab.textContent = `Starting (${ids.length})…`;
   showCancelButton();
 
@@ -687,6 +891,7 @@ async function onEvaluateClick() {
     const response = await chrome.runtime.sendMessage({
       type: "evaluate",
       listingIds: ids,
+      profileByListingId,
     });
     if (!response) {
       fab.textContent = "Error: no response";
@@ -706,7 +911,7 @@ async function onEvaluateClick() {
     for (const v of response.verdicts || []) {
       cachedVerdicts[v.id] = v;
     }
-    selectedIds.clear();
+    selections.clear();
     refreshAllOverlays();
     updateFAB();
   } catch (e) {
@@ -789,11 +994,17 @@ chrome.runtime.onMessage.addListener((msg) => {
 function onVerdictStreamed(verdict, done, total) {
   if (!verdict || !verdict.id) return;
   cachedVerdicts[verdict.id] = verdict;
-  selectedIds.delete(verdict.id);
+  selections.delete(verdict.id);
   const card = document.querySelector(`[data-mw-card="${verdict.id}"]`);
   if (card) {
-    card.querySelectorAll(".mw-checkbox, .mw-badge").forEach((n) => n.remove());
+    // Only the badge gets replaced — keep the picker in place so the
+    // user can change profile + re-evaluate alongside the verdict.
+    card.querySelectorAll(".mw-badge").forEach((n) => n.remove());
     attachBadge(card, verdict);
+    // Picker label tracks `selections`, which we just deleted from, so
+    // it'll show "Skip" again. Refresh it to reflect that.
+    const btn = card.querySelector(".mw-picker");
+    if (btn) updatePickerLabel(btn, verdict.id);
   }
   const fab = document.getElementById("mw-fab");
   if (fab && Number.isFinite(done) && Number.isFinite(total)) {

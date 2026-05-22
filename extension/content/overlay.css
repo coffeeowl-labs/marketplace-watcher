@@ -1,25 +1,94 @@
-.mw-checkbox {
+/* Per-card profile picker. Sits in the top-left so it doesn't collide
+   with the verdict badge in the top-right after analysis. */
+.mw-picker {
   position: absolute;
   top: 8px;
-  right: 8px;
-  width: 26px;
-  height: 26px;
-  background: rgba(255, 255, 255, 0.95);
+  left: 8px;
+  max-width: 140px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  background: rgba(255, 255, 255, 0.96);
   border: 2px solid #1877f2;
   border-radius: 4px;
-  font-size: 16px;
-  font-weight: bold;
-  line-height: 22px;
-  text-align: center;
+  font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  color: #1877f2;
   cursor: pointer;
   z-index: 9999;
   user-select: none;
-  color: #1877f2;
   box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.mw-checkbox.mw-checked {
+.mw-picker:hover {
+  background: white;
+}
+.mw-picker.mw-picker-active {
   background: #1877f2;
   color: white;
+}
+.mw-picker.mw-picker-active:hover {
+  background: #166fe5;
+}
+.mw-picker.mw-picker-profile {
+  background: #6a4c93;
+  border-color: #6a4c93;
+  color: white;
+}
+.mw-picker.mw-picker-profile:hover {
+  background: #503872;
+}
+.mw-picker-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mw-picker-caret {
+  font-size: 10px;
+  opacity: 0.8;
+}
+
+.mw-picker-popover {
+  background: #1a1a1a;
+  color: white;
+  min-width: 180px;
+  max-width: 240px;
+  padding: 6px 0;
+  border-radius: 8px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.65);
+  z-index: 99999;
+  display: flex;
+  flex-direction: column;
+  font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+.mw-picker-option {
+  background: transparent;
+  border: none;
+  color: white;
+  text-align: left;
+  padding: 7px 14px;
+  font: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mw-picker-option:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+.mw-picker-option-current {
+  background: rgba(24, 119, 242, 0.35);
+}
+.mw-picker-option-current:hover {
+  background: rgba(24, 119, 242, 0.5);
+}
+.mw-picker-divider {
+  height: 1px;
+  margin: 4px 0;
+  background: rgba(255, 255, 255, 0.15);
 }
 
 .mw-badge {
