@@ -21,7 +21,10 @@ function buildEnvelope(type, fields, logs) {
 
 // Streamed evaluate: callbacks fire as verdict messages arrive. Resolves
 // when the batch terminates (sentinel or disconnect), never rejects.
-async function runEvaluateBatch({ listings, costParams, onVerdict, onError, piggybackLogs }) {
+// If `signal` (an AbortSignal) fires, the port is disconnected immediately
+// — the host's onDisconnect path then reports a host_disconnect error,
+// which the caller interprets as a user-initiated cancel.
+async function runEvaluateBatch({ listings, costParams, onVerdict, onError, piggybackLogs, signal }) {
   return new Promise((resolve) => {
     let port;
     try {
@@ -43,6 +46,16 @@ async function runEvaluateBatch({ listings, costParams, onVerdict, onError, pigg
         resolve();
       }, DISCONNECT_GRACE_MS);
     };
+
+    if (signal) {
+      if (signal.aborted) {
+        finalize({ code: "cancelled", message: "user cancelled" });
+        return;
+      }
+      signal.addEventListener("abort", () => {
+        finalize({ code: "cancelled", message: "user cancelled" });
+      }, { once: true });
+    }
 
     port.onMessage.addListener((msg) => {
       if (!msg || typeof msg !== "object") return;

@@ -171,6 +171,12 @@ const scrapeQueue = []; // FIFO of {id, resolve, reject}
 const scrapeInFlight = new Map(); // listingId -> Promise<scrapedData>
 let scrapeWorkerRunning = false;
 
+// Per-tab AbortController so a Cancel click in tab A doesn't tear down an
+// unrelated batch running in tab B. The signal is threaded through scrape
+// and evaluate phases; aborting it disconnects the native port and skips
+// the eval phase entirely.
+const inFlightEvaluates = new Map(); // tabId -> AbortController
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "evaluate") {
     handleEvaluate(msg.listingIds, sender.tab.id, msg.options || {})
@@ -214,6 +220,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       .then(sendResponse)
       .catch((e) => sendResponse({ ok: false, error: e.message }));
     return true;
+  }
+  if (msg.type === "cancel_evaluate") {
+    const tabId = sender.tab && sender.tab.id;
+    const ac = tabId != null ? inFlightEvaluates.get(tabId) : null;
+    if (ac) ac.abort();
+    sendResponse({ ok: !!ac });
+    return false;
   }
 });
 
@@ -291,7 +304,7 @@ async function startScrapeWorker() {
 // across chunks; no HTTP retry, no _result_cache — port-disconnect is the
 // only failure mode and already-streamed verdicts are committed
 // incrementally by the caller.
-async function runEvaluateBatchStreaming(listings, costParams, onVerdictStreamed) {
+async function runEvaluateBatchStreaming(listings, costParams, signal, onVerdictStreamed) {
   const traceId = `eval-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   const ids = listings.map((l) => l.id);
   mwLog("helper_call_start", "info", {
@@ -309,6 +322,7 @@ async function runEvaluateBatchStreaming(listings, costParams, onVerdictStreamed
     listings,
     costParams,
     piggybackLogs,
+    signal,
     onVerdict: (verdict) => {
       verdicts.push(verdict);
       if (onVerdictStreamed) {
@@ -341,9 +355,31 @@ async function checkHelperHealth() {
 async function handleEvaluate(listingIds, sourceTabId, options = {}) {
   const includeImages = !!options.includeImages;
 
+  // Replace any prior in-flight controller for this tab — re-clicking
+  // Evaluate before the previous batch finishes shouldn't accumulate
+  // controllers (the prior handleEvaluate's signal becomes orphaned but
+  // its tear-down logic still runs through the abort listener).
+  const prior = inFlightEvaluates.get(sourceTabId);
+  if (prior) prior.abort();
+  const ac = new AbortController();
+  inFlightEvaluates.set(sourceTabId, ac);
+
+  try {
+    return await runEvaluatePhases(listingIds, sourceTabId, options, ac.signal);
+  } finally {
+    if (inFlightEvaluates.get(sourceTabId) === ac) {
+      inFlightEvaluates.delete(sourceTabId);
+    }
+  }
+}
+
+async function runEvaluatePhases(listingIds, sourceTabId, options, signal) {
+  const includeImages = !!options.includeImages;
+
   // Fail-fast: a 40-second scrape phase is wasted effort if the helper
   // isn't reachable. Confirm before we open any tabs.
   const helperUp = await checkHelperHealth();
+  if (signal.aborted) return { cancelled: true };
   if (!helperUp) {
     const msg = "Helper unreachable — run `marketplace-watcher doctor` to diagnose, " +
                 "or `marketplace-watcher install` if the host has never been installed.";
@@ -381,6 +417,10 @@ async function handleEvaluate(listingIds, sourceTabId, options = {}) {
 
   const scraped = await Promise.all(
     uncachedIds.map(async (id) => {
+      // Don't waste a tab if cancel landed before our turn in the queue.
+      if (signal.aborted) {
+        return { id, error: "cancelled", cancelled: true };
+      }
       try {
         const data = await enqueueScrape(id);
         done += 1;
@@ -431,6 +471,11 @@ async function handleEvaluate(listingIds, sourceTabId, options = {}) {
       }
     })
   );
+
+  if (signal.aborted) {
+    sendProgress(sourceTabId, { phase: "cancelled" });
+    return { cancelled: true };
+  }
 
   const valid = scraped.filter((s) => !s.error);
 
@@ -490,7 +535,7 @@ async function handleEvaluate(listingIds, sourceTabId, options = {}) {
       // the verdict:<id> cache and skip them. Also push to the source tab
       // so cards repaint one-by-one instead of all-at-once at batch end.
       let streamedCount = 0;
-      verdicts = await runEvaluateBatchStreaming(valid, costParams, async (v) => {
+      verdicts = await runEvaluateBatchStreaming(valid, costParams, signal, async (v) => {
         const item = valid.find((s) => s.id === v.id);
         const imgCount = item?.images_b64 ? item.images_b64.length : 0;
         const entry = {
@@ -534,6 +579,14 @@ async function handleEvaluate(listingIds, sourceTabId, options = {}) {
         },
       });
     } catch (e) {
+      // If the signal aborted, the port disconnect surfaces as a host_disconnect
+      // error here — that's expected and should be reported as a cancel, not a
+      // failure. Already-streamed verdicts remain in storage.
+      if (signal.aborted) {
+        console.log("[mw] evaluate cancelled by user");
+        sendProgress(sourceTabId, { phase: "cancelled" });
+        return { cancelled: true };
+      }
       console.error("[mw] helper error:", e.message);
       sendProgress(sourceTabId, { phase: "error", error: e.message });
       const errPayload = e.batchError

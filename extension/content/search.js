@@ -334,6 +334,14 @@ function ensureFAB() {
   fab.addEventListener("click", onEvaluateClick);
   bar.appendChild(fab);
 
+  const cancel = document.createElement("button");
+  cancel.id = "mw-cancel";
+  cancel.type = "button";
+  cancel.textContent = "Cancel";
+  cancel.hidden = true;
+  cancel.addEventListener("click", onCancelClick);
+  bar.appendChild(cancel);
+
   const setLoc = document.createElement("button");
   setLoc.id = "mw-setloc";
   setLoc.type = "button";
@@ -392,34 +400,58 @@ async function refreshSetLocLabel() {
   }
 }
 
+// Shared in-flight guard for every code path that opens a location prompt.
+// prompt() is supposed to be modal, but rapid clicks (especially via the FAB
+// row) can still queue overlapping invocations across async hops — the guard
+// keeps exactly one dialog on screen at a time and makes the Evaluate path
+// short-circuit instead of opening a second prompt on top of the first.
+let locationPromptOpen = false;
+
 async function onSetLocationClick() {
-  const stored = (await chrome.storage.local.get("user_location")).user_location;
-  const current = stored?.raw || "";
-  const input = prompt(
-    "Your location (ZIP code, city, or address):\n\nUsed to estimate distance, drive time, and gas cost. Leave blank to clear.",
-    current
-  );
-  if (input === null) return;
-  const trimmed = input.trim();
-  if (!trimmed) {
-    await chrome.storage.local.remove("user_location");
-  } else {
-    // Store raw only; background will geocode on next eval and persist lat/lng.
-    await chrome.storage.local.set({ user_location: { raw: trimmed } });
+  if (locationPromptOpen) return;
+  locationPromptOpen = true;
+  try {
+    const stored = (await chrome.storage.local.get("user_location")).user_location;
+    const current = stored?.raw || "";
+    const input = prompt(
+      "Your location (ZIP code, city, or address):\n\nUsed to estimate distance, drive time, and gas cost. Leave blank to clear.",
+      current
+    );
+    if (input === null) return;
+    const trimmed = input.trim();
+    if (!trimmed) {
+      await chrome.storage.local.remove("user_location");
+    } else {
+      // Store raw only; background will geocode on next eval and persist lat/lng.
+      await chrome.storage.local.set({ user_location: { raw: trimmed } });
+    }
+    refreshSetLocLabel();
+  } finally {
+    locationPromptOpen = false;
   }
-  refreshSetLocLabel();
 }
 
+// Returns true iff a non-empty user_location is in storage by the time the
+// promise resolves. Callers MUST honor the false return — proceeding to
+// analyze without a location loses distance/trip-cost adjustment and was
+// the path users were accidentally taking by clicking Set Location and
+// Evaluate in quick succession.
 async function ensureUserLocation() {
   const stored = (await chrome.storage.local.get("user_location")).user_location;
   if (stored && stored.raw) return true;
-  const input = prompt(
-    "Set your location to enable distance / trip-cost analysis.\n\nEnter a ZIP code, city, or address (or press Cancel to skip):"
-  );
-  if (input === null || !input.trim()) return false;
-  await chrome.storage.local.set({ user_location: { raw: input.trim() } });
-  refreshSetLocLabel();
-  return true;
+  if (locationPromptOpen) return false;
+  locationPromptOpen = true;
+  try {
+    const input = prompt(
+      "Set your location to enable distance / trip-cost analysis.\n\nEnter a ZIP code, city, or address (or press Cancel to skip):"
+    );
+    if (input === null || !input.trim()) return false;
+    await chrome.storage.local.set({ user_location: { raw: input.trim() } });
+    refreshSetLocLabel();
+    return true;
+  } finally {
+    locationPromptOpen = false;
+  }
 }
 
 async function onClearCacheClick() {
@@ -638,10 +670,18 @@ async function openContextPopup(id) {
 
 async function onEvaluateClick() {
   const fab = document.getElementById("mw-fab");
-  await ensureUserLocation(); // soft — proceeds even if user skips
+  // Hard gate: every verdict depends on distance/trip-cost reasoning, so
+  // running without a location quietly degrades the analysis. Refuse and
+  // flash the FAB instead of proceeding.
+  const hasLocation = await ensureUserLocation();
+  if (!hasLocation) {
+    flashFAB("Set your location first");
+    return;
+  }
   fab.disabled = true;
   const ids = Array.from(selectedIds);
   fab.textContent = `Starting (${ids.length})…`;
+  showCancelButton();
 
   try {
     const response = await chrome.runtime.sendMessage({
@@ -651,6 +691,11 @@ async function onEvaluateClick() {
     if (!response) {
       fab.textContent = "Error: no response";
       setTimeout(updateFAB, 4000);
+      return;
+    }
+    if (response.cancelled) {
+      fab.textContent = "Cancelled";
+      setTimeout(updateFAB, 2000);
       return;
     }
     if (response.error) {
@@ -667,6 +712,36 @@ async function onEvaluateClick() {
   } catch (e) {
     fab.textContent = `Error: ${e.message}`;
     setTimeout(updateFAB, 5000);
+  } finally {
+    hideCancelButton();
+  }
+}
+
+function showCancelButton() {
+  const btn = document.getElementById("mw-cancel");
+  if (btn) btn.hidden = false;
+}
+
+function hideCancelButton() {
+  const btn = document.getElementById("mw-cancel");
+  if (btn) btn.hidden = true;
+}
+
+async function onCancelClick() {
+  const btn = document.getElementById("mw-cancel");
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Cancelling…";
+  }
+  try {
+    await chrome.runtime.sendMessage({ type: "cancel_evaluate" });
+  } catch (_) {
+    // Background may already have torn down; harmless.
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "Cancel";
+    }
   }
 }
 
@@ -698,6 +773,10 @@ chrome.runtime.onMessage.addListener((msg) => {
     fab.textContent = "Evaluating with Claude…";
   } else if (msg.phase === "done") {
     fab.textContent = "Done";
+  } else if (msg.phase === "cancelled") {
+    fab.textContent = "Cancelled";
+    setTimeout(updateFAB, 2000);
+    hideCancelButton();
   } else if (msg.phase === "error") {
     fab.textContent = `Error: ${msg.error}`;
   }

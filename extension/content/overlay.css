@@ -245,7 +245,8 @@
 #mw-fab,
 #mw-clear,
 #mw-setloc,
-#mw-filter {
+#mw-filter,
+#mw-cancel {
   padding: 12px 22px;
   border: none;
   border-radius: 24px;
@@ -380,4 +381,16 @@ body.mw-hide-sponsored [data-mw-sponsored="1"] { display: none !important; }
 }
 #mw-clear:hover {
   background: #333;
+}
+
+#mw-cancel {
+  background: #c62828;
+  color: white;
+}
+#mw-cancel:hover:not(:disabled) {
+  background: #a01b1b;
+}
+#mw-cancel:disabled {
+  background: #888;
+  cursor: not-allowed;
 }
