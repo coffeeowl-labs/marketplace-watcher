@@ -20,7 +20,7 @@ from marketplace_watcher.install import (
     detect_manifest_dirs,
     run_doctor,
 )
-from marketplace_watcher.protocol import EXTENSION_ID, MANIFEST_SCHEMA_VERSION, NATIVE_HOST_NAME
+from marketplace_watcher.protocol import EXTENSION_ID, NATIVE_HOST_NAME
 
 
 def test_build_manifest_structure():
@@ -29,7 +29,14 @@ def test_build_manifest_structure():
     assert m["path"] == "/abs/path/to/host"
     assert m["type"] == "stdio"
     assert m["allowed_extensions"] == [EXTENSION_ID]
-    assert m["manifest_schema_version"] == MANIFEST_SCHEMA_VERSION
+
+
+def test_build_manifest_has_no_extra_keys():
+    # Mozilla's NativeManifest schema is closed — any unknown key makes the
+    # whole manifest fail validation and the browser reports "No such native
+    # application". Lock the key set so we can't reintroduce a stowaway.
+    m = _build_manifest("/abs/path/to/host")
+    assert set(m.keys()) == {"name", "description", "path", "type", "allowed_extensions"}
 
 
 def test_write_manifest_json_creates_parent_and_writes_valid_json(tmp_path):

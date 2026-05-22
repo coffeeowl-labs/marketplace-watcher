@@ -129,15 +129,17 @@ def detect_manifest_dirs() -> list[tuple[str, Path]]:
 # --- Manifest content -----------------------------------------------------
 
 def _build_manifest(host_shim_path: str) -> dict:
+    # Keep this dict EXACTLY to Mozilla's NativeManifest schema — closed-shape
+    # union of stdio/pkcs11/storage; any extra key (even one Mozilla "should"
+    # tolerate) makes the whole manifest fail validation and the browser
+    # reports "No such native application". The host's manifest-schema check
+    # lives in config.json instead.
     return {
         "name": NATIVE_HOST_NAME,
         "description": "Marketplace Watcher native messaging host",
         "path": host_shim_path,
         "type": "stdio",
         "allowed_extensions": [EXTENSION_ID],
-        # Non-standard fields for the manifest_schema_version check on host
-        # startup. Firefox tolerates unknown keys.
-        "manifest_schema_version": MANIFEST_SCHEMA_VERSION,
     }
 
 
