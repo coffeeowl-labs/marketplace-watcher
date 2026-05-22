@@ -49,6 +49,46 @@ def test_build_user_prompt_user_notes_emitted_when_present():
     assert "<user_notes>rust on frame</user_notes>" in out
 
 
+def test_build_user_prompt_criteria_emitted_when_profile_prompt_present():
+    listings = [{"id": "1", "title": "t", "price": "$1", "location": "l",
+                 "profile_prompt": "must be full suspension"}]
+    out = build_user_prompt(listings)
+    assert "<criteria>must be full suspension</criteria>" in out
+
+
+def test_build_user_prompt_no_criteria_when_profile_prompt_absent():
+    listings = [{"id": "1", "title": "t", "price": "$1", "location": "l"}]
+    out = build_user_prompt(listings)
+    assert "<criteria>" not in out
+
+
+def test_build_user_prompt_no_criteria_when_profile_prompt_empty_string():
+    # A trimmed-empty profile_prompt (e.g. only whitespace) must not emit
+    # a <criteria> element — that would tell Claude there are criteria to
+    # check when the user provided none, which would confuse the verdict.
+    listings = [{"id": "1", "title": "t", "price": "$1", "location": "l",
+                 "profile_prompt": "   \n  "}]
+    out = build_user_prompt(listings)
+    assert "<criteria>" not in out
+
+
+def test_build_user_prompt_criteria_placement_between_notes_and_photos():
+    # The system prompt expects user_notes → criteria → photos ordering so
+    # the model sees first-party context (notes + criteria) before the
+    # bulk image-analysis instructions.
+    listings = [{
+        "id": "1", "title": "t", "price": "$1", "location": "l",
+        "user_context": "rust on frame",
+        "profile_prompt": "must be full suspension",
+        "_image_paths": ["/tmp/x.jpg"],
+    }]
+    out = build_user_prompt(listings)
+    notes_pos = out.find("<user_notes>")
+    crit_pos = out.find("<criteria>")
+    photos_pos = out.find("<photos>")
+    assert -1 < notes_pos < crit_pos < photos_pos
+
+
 def test_build_user_prompt_trip_block_only_when_set():
     no_trip = build_user_prompt([{"id": "1", "title": "t", "price": "$1", "location": "l"}])
     assert "<distance_miles>" not in no_trip

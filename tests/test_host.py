@@ -16,6 +16,8 @@ from marketplace_watcher import host as h
 from marketplace_watcher.protocol import (
     ERR_INVALID_PAYLOAD,
     ERR_SCHEMA_MISMATCH,
+    MAX_PROFILE_NAME_CHARS,
+    MAX_PROFILE_PROMPT_CHARS,
     MAX_REASON_BYTES,
     MAX_VERDICT_BYTES,
     SCHEMA_VERSION,
@@ -61,6 +63,73 @@ def test_clamp_verdict_handles_non_string_reason():
     v = {"id": "1", "verdict": "good", "reason": None}
     out = h._clamp_verdict(v)
     assert out["reason"] is None  # unchanged
+
+
+# --- _validate_and_clamp_profile ------------------------------------------
+
+def test_clamp_profile_absent_field_is_ok():
+    item = {"id": "1", "title": "t"}
+    assert h._validate_and_clamp_profile(item) is None
+    # No flat keys added when no profile present.
+    assert "profile_name" not in item
+    assert "profile_prompt" not in item
+
+
+def test_clamp_profile_valid_shape_flattens_in_place():
+    item = {"id": "1", "profile": {"name": "Small MTB",
+                                    "prompt": "must be full suspension"}}
+    assert h._validate_and_clamp_profile(item) is None
+    assert item["profile_name"] == "Small MTB"
+    assert item["profile_prompt"] == "must be full suspension"
+
+
+def test_clamp_profile_clamps_oversized_prompt():
+    big = "x" * (MAX_PROFILE_PROMPT_CHARS + 5000)
+    item = {"id": "1", "profile": {"name": "x", "prompt": big}}
+    assert h._validate_and_clamp_profile(item) is None
+    assert len(item["profile_prompt"]) == MAX_PROFILE_PROMPT_CHARS
+
+
+def test_clamp_profile_clamps_oversized_name():
+    big = "n" * (MAX_PROFILE_NAME_CHARS + 100)
+    item = {"id": "1", "profile": {"name": big, "prompt": "p"}}
+    assert h._validate_and_clamp_profile(item) is None
+    assert len(item["profile_name"]) == MAX_PROFILE_NAME_CHARS
+
+
+def test_clamp_profile_rejects_non_dict():
+    item = {"id": "1", "profile": "not an object"}
+    err = h._validate_and_clamp_profile(item)
+    assert err is not None
+    assert err["code"] == ERR_INVALID_PAYLOAD
+
+
+def test_clamp_profile_rejects_non_string_name():
+    item = {"id": "1", "profile": {"name": 42, "prompt": "p"}}
+    err = h._validate_and_clamp_profile(item)
+    assert err is not None
+    assert err["code"] == ERR_INVALID_PAYLOAD
+
+
+def test_clamp_profile_rejects_non_string_prompt():
+    item = {"id": "1", "profile": {"name": "n", "prompt": None}}
+    err = h._validate_and_clamp_profile(item)
+    assert err is not None
+    assert err["code"] == ERR_INVALID_PAYLOAD
+
+
+def test_clamp_profile_rejects_missing_name():
+    item = {"id": "1", "profile": {"prompt": "p"}}
+    err = h._validate_and_clamp_profile(item)
+    assert err is not None
+    assert err["code"] == ERR_INVALID_PAYLOAD
+
+
+def test_clamp_profile_rejects_missing_prompt():
+    item = {"id": "1", "profile": {"name": "n"}}
+    err = h._validate_and_clamp_profile(item)
+    assert err is not None
+    assert err["code"] == ERR_INVALID_PAYLOAD
 
 
 # --- _validate_envelope ----------------------------------------------------

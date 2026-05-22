@@ -26,6 +26,8 @@ from .protocol import (
     ERR_SCHEMA_MISMATCH,
     ERR_UNKNOWN_MESSAGE,
     MANIFEST_SCHEMA_VERSION,
+    MAX_PROFILE_NAME_CHARS,
+    MAX_PROFILE_PROMPT_CHARS,
     MAX_REASON_BYTES,
     MAX_VERDICT_BYTES,
     MSG_ERROR,
@@ -145,6 +147,34 @@ def _validate_envelope(msg: dict, request_id_required: bool = True) -> Optional[
     return None
 
 
+def _validate_and_clamp_profile(item: dict) -> Optional[dict]:
+    """If a listing carries a `profile` field, validate and clamp it in
+    place. Adds flat `profile_name` and `profile_prompt` keys (which
+    build_user_prompt consumes) so downstream code doesn't have to drill
+    into the nested object. Returns an error dict on malformed shape,
+    None on valid OR absent (absent is normal — listings without a
+    profile evaluate exactly as before).
+
+    Defense in depth: this MUST run at the host boundary, not in
+    build_user_prompt. A buggy extension shipping a 900 KB profile
+    needs to be rejected here, before it reaches Claude's context.
+    """
+    prof = item.get("profile")
+    if prof is None:
+        return None
+    if not isinstance(prof, dict):
+        return {"code": ERR_INVALID_PAYLOAD,
+                "message": "listing.profile must be an object"}
+    name = prof.get("name")
+    prompt = prof.get("prompt")
+    if not isinstance(name, str) or not isinstance(prompt, str):
+        return {"code": ERR_INVALID_PAYLOAD,
+                "message": "listing.profile must have string name and prompt"}
+    item["profile_name"] = name[:MAX_PROFILE_NAME_CHARS]
+    item["profile_prompt"] = prompt[:MAX_PROFILE_PROMPT_CHARS]
+    return None
+
+
 def _send_error(req_id: Optional[str], err: dict) -> None:
     payload = {
         "type": MSG_ERROR,
@@ -170,6 +200,10 @@ def _handle_evaluate(msg: dict, config: Config) -> None:
         if not isinstance(item, dict) or "id" not in item:
             _send_error(req_id, {"code": ERR_INVALID_PAYLOAD,
                                  "message": "each listing must have an id"})
+            return
+        perr = _validate_and_clamp_profile(item)
+        if perr is not None:
+            _send_error(req_id, perr)
             return
 
     cp_raw = msg.get("cost_params") or {}

@@ -18,6 +18,13 @@ EXTENSION_ID = "marketplace-watcher@coffeeowl-labs.github.io"
 MAX_REASON_BYTES = 32 * 1024
 MAX_VERDICT_BYTES = 256 * 1024
 
+# Per-listing evaluation profile caps (see DISTRIBUTION.md "Feature plan —
+# Evaluation profiles"). Not driven by the 1 MB ceiling — at 2000 chars
+# across 20 listings that's only 40 KB — but by what counts as a reasonable
+# "paragraph of criteria" without bloating Claude's context per listing.
+MAX_PROFILE_NAME_CHARS = 200
+MAX_PROFILE_PROMPT_CHARS = 2000
+
 # Message types — extension → host
 MSG_EVALUATE = "evaluate"
 MSG_HEALTH = "health"
