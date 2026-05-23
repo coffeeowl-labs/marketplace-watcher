@@ -13,6 +13,9 @@ from marketplace_watcher.claude_runner import (
     CHUNK_SIZE,
     CostParams,
     _ChunkResult,
+    _extract_text_from_event,
+    _scan_balanced_object,
+    _StreamingArrayExtractor,
     build_system_prompt,
     build_user_prompt,
     evaluate_parallel_streaming,
@@ -189,6 +192,30 @@ def test_all_chunks_fail_emits_done_with_first_error(isolated_dirs):
     assert dones[0]["code"] == "claude_timeout"
 
 
+def test_streaming_via_on_partial_dedupes_against_final_verdicts(isolated_dirs):
+    # When a chunk worker streams verdicts via on_partial AND also returns
+    # the same verdicts in _ChunkResult.verdicts, the consumer must emit
+    # each id exactly once.
+    listings = _listings(3)
+    verdicts: list = []
+    dones: list = []
+
+    def fake_run(chunk, claude_path, cost, on_partial=None):
+        objs = [{"id": item["id"], "verdict": "good", "reason": "ok"}
+                for item in chunk]
+        if on_partial is not None:
+            for o in objs:
+                on_partial(o)
+        return _ChunkResult(verdicts=objs, sent_ids=[i["id"] for i in chunk])
+
+    with patch("marketplace_watcher.claude_runner._run_chunk", side_effect=fake_run):
+        evaluate_parallel_streaming(listings, "/usr/bin/claude", CostParams(),
+                                     verdicts.append, dones.append)
+
+    assert [v["id"] for v in verdicts] == ["0", "1", "2"]
+    assert dones == [None]
+
+
 def test_done_fires_exactly_once(isolated_dirs):
     # Critic-pass guard: with as_completed semantics, the wrong design would
     # fire on_done from each chunk worker — verify only once.
@@ -204,3 +231,128 @@ def test_done_fires_exactly_once(isolated_dirs):
         evaluate_parallel_streaming(listings, "/usr/bin/claude", CostParams(),
                                      lambda v: None, dones.append)
     assert len(dones) == 1
+
+
+# --- _scan_balanced_object -------------------------------------------------
+
+def test_scan_balanced_object_simple():
+    s = '{"a":1}rest'
+    assert _scan_balanced_object(s, 0) == 6
+
+
+def test_scan_balanced_object_nested():
+    s = '{"a":{"b":2},"c":3}'
+    assert _scan_balanced_object(s, 0) == len(s) - 1
+
+
+def test_scan_balanced_object_string_contains_braces():
+    s = '{"a":"}}","b":1}'
+    # The `}}` inside the string must not close the object.
+    assert _scan_balanced_object(s, 0) == len(s) - 1
+
+
+def test_scan_balanced_object_escaped_quote_in_string():
+    s = '{"a":"x\\"y","b":1}'
+    assert _scan_balanced_object(s, 0) == len(s) - 1
+
+
+def test_scan_balanced_object_incomplete_returns_neg_one():
+    assert _scan_balanced_object('{"a":1', 0) == -1
+    assert _scan_balanced_object('{"a":{"b":2}', 0) == -1
+
+
+# --- _StreamingArrayExtractor ----------------------------------------------
+
+def test_extractor_emits_objects_as_they_complete():
+    x = _StreamingArrayExtractor()
+    # Open bracket + first complete object, no comma yet.
+    assert x.feed('[{"id":"1","verdict":"good"}') == [
+        {"id": "1", "verdict": "good"},
+    ]
+    # Continue with second object, still mid-array.
+    assert x.feed(', {"id":"2","verdict":"skip"}') == [
+        {"id": "2", "verdict": "skip"},
+    ]
+    # Closing bracket — no new objects.
+    assert x.feed("]") == []
+
+
+def test_extractor_handles_snapshot_replacement():
+    # stream-json "assistant" snapshots resend the whole message every time.
+    x = _StreamingArrayExtractor()
+    first = '[{"id":"1","verdict":"good"}'
+    second = first + ', {"id":"2","verdict":"skip"}'
+    assert x.feed(first) == [{"id": "1", "verdict": "good"}]
+    # Second feed is a longer snapshot starting with the first — must yield
+    # only the new object, not re-emit "1".
+    assert x.feed(second) == [{"id": "2", "verdict": "skip"}]
+
+
+def test_extractor_does_not_emit_partial_object():
+    x = _StreamingArrayExtractor()
+    assert x.feed('[{"id":"1","verdict":"goo') == []
+    # Completing it via delta returns it.
+    assert x.feed('d"}') == [{"id": "1", "verdict": "good"}]
+
+
+def test_extractor_skips_braces_inside_strings():
+    x = _StreamingArrayExtractor()
+    out = x.feed('[{"id":"1","reason":"price is {weird}"}]')
+    assert out == [{"id": "1", "reason": "price is {weird}"}]
+
+
+def test_extractor_finalize_picks_up_late_object():
+    x = _StreamingArrayExtractor()
+    x.feed('[{"id":"1","verdict":"good"}')
+    # Caller signals end-of-output without further deltas.
+    assert x.finalize() == []  # nothing new to emit
+
+
+def test_extractor_handles_nested_objects():
+    x = _StreamingArrayExtractor()
+    out = x.feed('[{"id":"1","extra":{"nested":true},"verdict":"good"}]')
+    assert out == [{"id": "1", "extra": {"nested": True}, "verdict": "good"}]
+
+
+# --- _extract_text_from_event ----------------------------------------------
+
+def test_extract_text_from_content_block_delta():
+    evt = {"type": "content_block_delta", "delta": {"type": "text_delta",
+                                                      "text": "hello"}}
+    text, kind = _extract_text_from_event(evt)
+    assert text == "hello"
+    assert kind == "delta"
+
+
+def test_extract_text_from_assistant_snapshot():
+    evt = {
+        "type": "assistant",
+        "message": {"content": [
+            {"type": "text", "text": "part1"},
+            {"type": "text", "text": "part2"},
+        ]},
+    }
+    text, kind = _extract_text_from_event(evt)
+    assert text == "part1part2"
+    assert kind == "snapshot"
+
+
+def test_extract_text_from_result_event():
+    evt = {"type": "result", "result": "final text"}
+    text, kind = _extract_text_from_event(evt)
+    assert text == "final text"
+    assert kind == "snapshot"
+
+
+def test_extract_text_from_unknown_event_returns_empty():
+    text, kind = _extract_text_from_event({"type": "system", "subtype": "init"})
+    assert text == ""
+    assert kind == ""
+
+
+def test_extract_text_from_event_handles_missing_fields():
+    # content_block_delta without delta key — defensive against shape drift.
+    assert _extract_text_from_event({"type": "content_block_delta"}) == ("", "")
+    # assistant event with non-list content.
+    assert _extract_text_from_event({"type": "assistant",
+                                      "message": {"content": "not a list"}}) == ("", "")

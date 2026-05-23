@@ -183,6 +183,143 @@ def _parse_claude_json(stdout: str):
         raise
 
 
+# --- Incremental JSON-array extraction for stream-json -----------------------
+
+class _StreamingArrayExtractor:
+    """Feed text fragments; extract complete top-level objects from a growing
+    `[{...}, {...}, ...]` array as soon as each `{...}` closes.
+
+    Designed for claude's `--output-format stream-json`: claude builds the
+    verdict array character-by-character; we want to emit each verdict as
+    soon as its closing `}` arrives, not wait for the closing `]` (and not
+    wait for the subprocess to exit). Tracks a cursor into the accumulated
+    text so subsequent feeds don't re-emit already-yielded objects.
+
+    NOT a general JSON streaming parser — assumes the top-level structure
+    is exactly `[<object>, <object>, ...]` matching our system prompt's
+    contract. Falls back gracefully on malformed input (yields what it can
+    find, doesn't raise).
+    """
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._cursor = 0  # next byte to scan for `{`
+
+    def feed(self, text: str) -> list[dict]:
+        """Append `text` (or replace if the new text is a longer snapshot
+        starting with our existing buffer) and return any newly-complete
+        objects. Idempotent for repeated identical input."""
+        if not text:
+            return []
+        if text.startswith(self._buf):
+            # Snapshot of full message so far — replace.
+            self._buf = text
+        elif self._buf.startswith(text):
+            # Shorter snapshot than what we have; ignore (shouldn't happen
+            # but stream-json events can be redundant across versions).
+            return []
+        else:
+            # Delta — append.
+            self._buf += text
+        return self._extract_new_objects()
+
+    def finalize(self) -> list[dict]:
+        """Last scan of whatever's in the buffer — call after the producer
+        has signaled end-of-output. Returns any objects we missed."""
+        return self._extract_new_objects()
+
+    def _extract_new_objects(self) -> list[dict]:
+        out: list[dict] = []
+        while self._cursor < len(self._buf):
+            # Skip whitespace, commas, leading '['.
+            while self._cursor < len(self._buf) and self._buf[self._cursor] in " \t\n\r,[":
+                self._cursor += 1
+            if self._cursor >= len(self._buf):
+                break
+            if self._buf[self._cursor] != "{":
+                # We're sitting on something that isn't an object boundary
+                # — either trailing whitespace before `]`, a fence, or
+                # garbage. Stop; finalize() will retry once more input has
+                # arrived (or signal we're truly done).
+                break
+            end = _scan_balanced_object(self._buf, self._cursor)
+            if end == -1:
+                break  # Object not yet complete.
+            try:
+                obj = json.loads(self._buf[self._cursor : end + 1])
+                if isinstance(obj, dict):
+                    out.append(obj)
+            except json.JSONDecodeError:
+                # Our brace walk produced something json can't parse — skip
+                # this candidate so we don't loop forever.
+                pass
+            self._cursor = end + 1
+        return out
+
+
+def _scan_balanced_object(s: str, start: int) -> int:
+    """Walk forward from `s[start] == '{'`, respecting JSON string escaping,
+    to find the matching `}`. Returns the index of that `}` or -1 if the
+    object isn't complete yet. Assumes start points at `{`."""
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(s)):
+        c = s[i]
+        if escape:
+            escape = False
+            continue
+        if in_string:
+            if c == "\\":
+                escape = True
+            elif c == '"':
+                in_string = False
+            continue
+        if c == '"':
+            in_string = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _extract_text_from_event(evt: dict) -> tuple[str, str]:
+    """Pull any text content out of an arbitrary stream-json event. Returns
+    `(text, kind)` where kind is "snapshot" (replace accumulator) or "delta"
+    (append). Defensive about exact event shape since claude CLI's
+    stream-json format has shifted across versions. Returns ("", "") if no
+    text is present."""
+    et = evt.get("type")
+    # Anthropic SSE-style delta event.
+    if et == "content_block_delta":
+        delta = evt.get("delta")
+        if isinstance(delta, dict):
+            text = delta.get("text")
+            if isinstance(text, str):
+                return text, "delta"
+    # claude CLI "assistant" event with a full message snapshot.
+    if et == "assistant":
+        msg = evt.get("message")
+        if isinstance(msg, dict):
+            content = msg.get("content")
+            if isinstance(content, list):
+                parts = [
+                    c.get("text", "") for c in content
+                    if isinstance(c, dict) and c.get("type") == "text"
+                ]
+                if parts:
+                    return "".join(parts), "snapshot"
+    # Final result event — definitive snapshot.
+    if et == "result":
+        text = evt.get("result")
+        if isinstance(text, str):
+            return text, "snapshot"
+    return "", ""
+
+
 @dataclass
 class _ChunkResult:
     verdicts: Optional[list[dict]] = None
@@ -191,10 +328,22 @@ class _ChunkResult:
     sent_ids: Optional[list] = None
 
 
-def _run_chunk(chunk: list[dict], claude_path: str, cost: CostParams) -> _ChunkResult:
+def _run_chunk(
+    chunk: list[dict],
+    claude_path: str,
+    cost: CostParams,
+    on_partial: Optional[Callable[[dict], None]] = None,
+) -> _ChunkResult:
     """Runs a single chunk through one claude subprocess. Returns either
-    verdicts (in input order) or an error description. Never raises."""
+    verdicts (in input order) or an error description. Never raises.
+
+    If `on_partial` is given, each verdict is emitted as soon as its
+    closing `}` arrives over claude's stream-json stdout — so users see
+    per-listing results progressively instead of waiting for the whole
+    chunk to finish. The returned `_ChunkResult.verdicts` is still the
+    full, ordered list (the caller dedupes against what was streamed)."""
     sent_ids = [item["id"] for item in chunk]
+    sent_ids_set = set(sent_ids)
     try:
         with tempfile.TemporaryDirectory(prefix="mw_imgs_") as tempdir:
             image_count = _decode_images_to_dir(chunk, tempdir)
@@ -211,66 +360,175 @@ def _run_chunk(chunk: list[dict], claude_path: str, cost: CostParams) -> _ChunkR
                 claude_path,
                 "-p",
                 "--model", "sonnet",
+                "--output-format", "stream-json",
+                "--verbose",
                 "--append-system-prompt", build_system_prompt(cost),
             ]
             if image_count:
                 argv.extend(["--add-dir", tempdir])
             try:
-                proc = subprocess.run(
+                proc = subprocess.Popen(
                     argv,
-                    input=user_prompt,
-                    capture_output=True,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
-                    timeout=CLAUDE_TIMEOUT_SECONDS,
+                    bufsize=1,
                     env=scrubbed_env(),
                     creationflags=_SUBPROCESS_CREATIONFLAGS,
                 )
-            except subprocess.TimeoutExpired:
-                helper_log("claude_call_end", level="error", reason="timeout",
-                           elapsed_s=round(time.time() - started, 2),
-                           listing_ids=sent_ids)
-                return _ChunkResult(error="claude timed out", error_code="claude_timeout",
-                                    sent_ids=sent_ids)
             except FileNotFoundError:
                 helper_log("claude_call_end", level="error", reason="missing",
                            claude_path=claude_path, listing_ids=sent_ids)
                 return _ChunkResult(error=f"claude binary not found at {claude_path}",
                                     error_code="claude_missing", sent_ids=sent_ids)
 
+            stderr_chunks: list[str] = []
+
+            def _drain_stderr():
+                try:
+                    for line in proc.stderr:
+                        stderr_chunks.append(line)
+                except Exception:
+                    pass
+
+            stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+            stderr_thread.start()
+
+            try:
+                proc.stdin.write(user_prompt)
+                proc.stdin.close()
+            except BrokenPipeError:
+                pass
+
+            extractor = _StreamingArrayExtractor()
+            verdicts_by_id: dict = {}
+            emitted_ids: set = set()
+            raw_stdout: list[str] = []
+            timed_out = False
+            deadline = started + CLAUDE_TIMEOUT_SECONDS
+
+            def _consume(obj: dict) -> None:
+                oid = obj.get("id")
+                if not isinstance(oid, str) or oid not in sent_ids_set:
+                    return
+                if oid in verdicts_by_id:
+                    return
+                verdicts_by_id[oid] = obj
+                if on_partial is not None and oid not in emitted_ids:
+                    emitted_ids.add(oid)
+                    try:
+                        on_partial(obj)
+                    except Exception as e:
+                        helper_log("on_partial_error", level="warn",
+                                   exception=str(e))
+
+            try:
+                for line in proc.stdout:
+                    if time.time() > deadline:
+                        timed_out = True
+                        proc.kill()
+                        break
+                    raw_stdout.append(line)
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        evt = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(evt, dict):
+                        continue
+                    text, _kind = _extract_text_from_event(evt)
+                    if not text:
+                        continue
+                    for obj in extractor.feed(text):
+                        _consume(obj)
+            except Exception as e:
+                helper_log("claude_stream_read_error", level="warn",
+                           exception=str(e))
+
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                timed_out = True
+
+            stderr_thread.join(timeout=1.0)
+            stderr_text = "".join(stderr_chunks).strip()
             elapsed = time.time() - started
+
+            if timed_out:
+                helper_log("claude_call_end", level="error", reason="timeout",
+                           elapsed_s=round(elapsed, 2), listing_ids=sent_ids)
+                return _ChunkResult(error="claude timed out",
+                                    error_code="claude_timeout",
+                                    sent_ids=sent_ids)
+
+            for obj in extractor.finalize():
+                _consume(obj)
+
+            # Fallback: if stream-json events yielded nothing parseable but
+            # the subprocess succeeded, try the legacy whole-stdout parse
+            # against any "result" event payload we captured. Belt-and-
+            # suspenders for claude CLI version drift.
+            if not verdicts_by_id and proc.returncode == 0:
+                for line in raw_stdout:
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        evt = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(evt, dict) and evt.get("type") == "result":
+                        text = evt.get("result")
+                        if isinstance(text, str):
+                            try:
+                                parsed = _parse_claude_json(text)
+                                if isinstance(parsed, list):
+                                    for obj in parsed:
+                                        if isinstance(obj, dict):
+                                            _consume(obj)
+                            except (json.JSONDecodeError, ValueError):
+                                pass
+
             if proc.returncode != 0:
                 helper_log("claude_call_end", level="error",
                            returncode=proc.returncode,
-                           stderr=proc.stderr.strip()[:1000],
+                           stderr=stderr_text[:1000],
                            elapsed_s=round(elapsed, 2),
                            listing_ids=sent_ids)
                 return _ChunkResult(
-                    error=f"claude exited {proc.returncode}: {proc.stderr.strip()[:500]}",
+                    error=f"claude exited {proc.returncode}: {stderr_text[:500]}",
                     error_code="claude_failed",
                     sent_ids=sent_ids,
                 )
 
-            try:
-                verdicts = _parse_claude_json(proc.stdout)
-            except json.JSONDecodeError as e:
+            if not verdicts_by_id:
                 helper_log("claude_call_end", level="error",
-                           parse_error=str(e), stdout=proc.stdout[:2000],
-                           listing_ids=sent_ids)
-                return _ChunkResult(error=f"claude returned unparseable JSON: {e}",
-                                    error_code="claude_failed", sent_ids=sent_ids)
+                           reason="no_verdicts_parsed",
+                           elapsed_s=round(elapsed, 2),
+                           listing_ids=sent_ids,
+                           stderr=stderr_text[:1000])
+                return _ChunkResult(error="claude returned unparseable JSON",
+                                    error_code="claude_failed",
+                                    sent_ids=sent_ids)
 
-            got_ids = [v.get("id") for v in verdicts] if isinstance(verdicts, list) else []
+            got_ids = [oid for oid in sent_ids if oid in verdicts_by_id]
             if got_ids != sent_ids:
                 helper_log("claude_call_end", level="error",
                            elapsed_s=round(elapsed, 2),
                            sent_ids=sent_ids, got_ids=got_ids,
-                           stdout=proc.stdout[:2000])
+                           stderr=stderr_text[:1000])
                 return _ChunkResult(
                     error=f"verdict id mismatch. sent={sent_ids} got={got_ids}",
                     error_code="verdict_id_mismatch",
                     sent_ids=sent_ids,
                 )
 
+            verdicts = [verdicts_by_id[oid] for oid in sent_ids]
             helper_log("claude_call_end", level="info",
                        elapsed_s=round(elapsed, 2),
                        image_count=image_count, verdicts=verdicts)
@@ -313,8 +571,10 @@ def evaluate_parallel_streaming(
     started = time.time()
 
     def worker(chunk):
-        result = _run_chunk(chunk, claude_path, cost)
-        q.put(result)
+        def emit_partial(v: dict) -> None:
+            q.put(("verdict", v))
+        result = _run_chunk(chunk, claude_path, cost, on_partial=emit_partial)
+        q.put(("done", result))
 
     workers = []
     for chunk in chunks:
@@ -324,17 +584,33 @@ def evaluate_parallel_streaming(
 
     chunks_remaining = len(chunks)
     first_error: Optional[dict] = None
+    seen_ids: set = set()
 
     while chunks_remaining > 0:
-        result: _ChunkResult = q.get()
-        if result.error is None:
-            for v in result.verdicts or []:
+        msg = q.get()
+        tag = msg[0]
+        if tag == "verdict":
+            v = msg[1]
+            vid = v.get("id")
+            if vid not in seen_ids:
+                seen_ids.add(vid)
                 on_verdict(v)
-        else:
-            if first_error is None:
-                first_error = {"code": result.error_code or "internal_error",
-                               "message": result.error}
-        chunks_remaining -= 1
+        else:  # "done"
+            result: _ChunkResult = msg[1]
+            if result.error is None:
+                # Backfill: a worker that didn't stream (test mocks, fallback
+                # parse path) still returns verdicts here. Skip ones already
+                # streamed via on_partial.
+                for v in result.verdicts or []:
+                    vid = v.get("id")
+                    if vid not in seen_ids:
+                        seen_ids.add(vid)
+                        on_verdict(v)
+            else:
+                if first_error is None:
+                    first_error = {"code": result.error_code or "internal_error",
+                                   "message": result.error}
+            chunks_remaining -= 1
 
     for t in workers:
         t.join(timeout=1.0)
