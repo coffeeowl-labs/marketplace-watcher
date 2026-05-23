@@ -328,11 +328,10 @@
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
 }
 
-#mw-fab,
 #mw-clear,
 #mw-setloc,
 #mw-filter,
-#mw-cancel {
+#mw-stop-all {
   padding: 12px 22px;
   border: none;
   border-radius: 24px;
@@ -464,18 +463,6 @@ body:not(.mw-hide-junk) [data-mw-card][data-mw-junk="1"] {
   background: #1a2733;
 }
 
-#mw-fab {
-  background: #1877f2;
-  color: white;
-}
-#mw-fab:disabled {
-  background: #999;
-  cursor: not-allowed;
-}
-#mw-fab:hover:not(:disabled) {
-  background: #166fe5;
-}
-
 #mw-clear {
   background: #555;
   color: white;
@@ -484,14 +471,63 @@ body:not(.mw-hide-junk) [data-mw-card][data-mw-junk="1"] {
   background: #333;
 }
 
-#mw-cancel {
+#mw-stop-all {
   background: #c62828;
   color: white;
 }
-#mw-cancel:hover:not(:disabled) {
+#mw-stop-all:hover {
   background: #a01b1b;
 }
-#mw-cancel:disabled {
-  background: #888;
-  cursor: not-allowed;
+#mw-stop-all.mw-flash {
+  background: #f57c00;
+}
+
+/* --- Transient batcher states ------------------------------------------ */
+/* Cards in pending-undo / scraping / queued / evaluating / error states
+   show a transient badge in the same position as the verdict badge so the
+   visual rhythm of the grid doesn't shift. */
+.mw-badge.mw-transient {
+  font-weight: 700;
+  letter-spacing: 0.3px;
+}
+.mw-badge.mw-pending {
+  background: #1565c0;
+  color: white;
+  /* Pulsing ring telegraphs "this is about to commit" — gives the user a
+     visual cue they can cancel via the picker. */
+}
+@media (prefers-reduced-motion: no-preference) {
+  .mw-badge.mw-pending {
+    animation: mw-pending-pulse 1.6s ease-in-out infinite;
+  }
+}
+@keyframes mw-pending-pulse {
+  0%, 100% { box-shadow: 0 0 0 2px rgba(21, 101, 192, 0.55), 0 4px 12px rgba(21, 101, 192, 0.45); }
+  50%      { box-shadow: 0 0 0 5px rgba(21, 101, 192, 0.85), 0 6px 22px rgba(21, 101, 192, 0.75); }
+}
+.mw-badge.mw-scraping {
+  background: #3949ab;
+  color: white;
+}
+.mw-badge.mw-waiting {
+  background: #455a64;
+  color: #e0e0e0;
+  font-style: italic;
+}
+.mw-badge.mw-queued {
+  background: #00838f;
+  color: white;
+}
+.mw-badge.mw-evaluating {
+  background: #6a4c93;
+  color: white;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .mw-badge.mw-evaluating {
+    animation: mw-evaluating-pulse 1.4s ease-in-out infinite;
+  }
+}
+@keyframes mw-evaluating-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.7; }
 }

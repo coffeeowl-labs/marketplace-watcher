@@ -1,12 +1,18 @@
-// background.js — orchestrates scraping + evaluation
+// background.js — stateless transport for the content-side batcher.
 //
-// Flow when search page sends {type:'evaluate', listingIds}:
-//   1. Look up cached verdicts; only fetch the uncached ones
-//   2. For each uncached id, open an inactive tab, wait for listing.js to
-//      send {type:'scraped'}, then close the tab. Sequential with delay so
-//      we don't open 20 tabs at once.
-//   3. POST scraped batch to local helper, get verdicts
-//   4. Persist new verdicts to storage and return full set to the search page
+// Auto-commit batcher lives in extension/content/batcher.js. Background's
+// only job here is to expose RPCs and own the host port lifecycle:
+//   - {type:'scrape', listingId}      → returns scraped data (dedup-cached)
+//   - {type:'check_health'}           → returns helper-up boolean
+//   - {type:'ship_batch', requestId,  → fires runEvaluateBatchStreaming;
+//      items, includeImages}            streams verdicts back via
+//                                       tabs.sendMessage(verdict_streamed);
+//                                       finishes with batch_done(requestId)
+//   - {type:'cancel_batch', requestId}→ aborts that one batch
+//
+// Per-request AbortControllers (one per requestId) replace the old
+// per-tab AbortController so the batcher can run multiple concurrent
+// chunks per tab without them tearing each other down.
 
 // --- Logging --------------------------------------------------------------
 // mwLog buffers entries into a session-scoped ring buffer; entries drain
@@ -171,35 +177,45 @@ const scrapeQueue = []; // FIFO of {id, resolve, reject}
 const scrapeInFlight = new Map(); // listingId -> Promise<scrapedData>
 let scrapeWorkerRunning = false;
 
-// Per-tab AbortController so a Cancel click in tab A doesn't tear down an
-// unrelated batch running in tab B. The signal is threaded through scrape
-// and evaluate phases; aborting it disconnects the native port and skips
-// the eval phase entirely.
-const inFlightEvaluates = new Map(); // tabId -> AbortController
+// Per-request AbortController. One per shipped batch (keyed by requestId
+// the content batcher generates). Lets the batcher run multiple chunks
+// concurrently per tab and cancel each one independently.
+const inFlightBatches = new Map(); // requestId -> { ac: AbortController, tabId }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.type === "evaluate") {
-    handleEvaluate(
-      msg.listingIds,
-      sender.tab.id,
-      msg.options || {},
-      msg.profileByListingId || {},
-    )
+  if (msg.type === "scrape") {
+    handleScrapeRpc(msg.listingId)
       .then(sendResponse)
-      .catch((e) => sendResponse({ error: e.message }));
-    return true; // async response
+      .catch((e) => sendResponse({ ok: false, error: e.message }));
+    return true;
   }
-  if (msg.type === "prefetch") {
-    // Fire-and-forget: queue the scrape but don't make the sender wait.
-    enqueueScrape(msg.listingId).catch(() => {});
+  if (msg.type === "check_health") {
+    checkHelperHealth()
+      .then((ok) => sendResponse({ ok }))
+      .catch((e) => sendResponse({ ok: false, error: e.message }));
+    return true;
+  }
+  if (msg.type === "ship_batch") {
+    // Respond immediately so the content-script send doesn't hang. Verdicts
+    // and the final done message flow asynchronously via tabs.sendMessage.
+    handleShipBatch(msg, sender.tab && sender.tab.id).catch((e) => {
+      mwLog("ship_batch_top_error", "error", {
+        error: e.message,
+        requestId: msg.requestId,
+      });
+    });
     sendResponse({ ok: true });
+    return false;
+  }
+  if (msg.type === "cancel_batch") {
+    const entry = inFlightBatches.get(msg.requestId);
+    if (entry) entry.ac.abort();
+    sendResponse({ ok: !!entry });
     return false;
   }
   if (msg.type === "scraped") {
     // Embedded diagnostics from the listing tab — backup path in case the
     // tab was closed before its own runtime.sendMessage relays flushed.
-    // We dedupe via the entry timestamp + category so re-receiving via the
-    // direct relay path doesn't double-write.
     if (Array.isArray(msg.diagnostics)) {
       for (const e of msg.diagnostics) {
         e.viaScrapedBackup = true;
@@ -212,9 +228,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return false;
   }
   if (msg.type === "log") {
-    // Embedded diagnostics from content-script scrape attempts. We trust the
-    // entry's own level field so a content-script error gets through even if
-    // debug is off.
     if (msg.entry) enqueueLogEntry(msg.entry);
     if (Array.isArray(msg.entries)) for (const e of msg.entries) enqueueLogEntry(e);
     sendResponse({ ok: true });
@@ -226,14 +239,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       .catch((e) => sendResponse({ ok: false, error: e.message }));
     return true;
   }
-  if (msg.type === "cancel_evaluate") {
-    const tabId = sender.tab && sender.tab.id;
-    const ac = tabId != null ? inFlightEvaluates.get(tabId) : null;
-    if (ac) ac.abort();
-    sendResponse({ ok: !!ac });
-    return false;
-  }
 });
+
+async function handleScrapeRpc(listingId) {
+  try {
+    const data = await enqueueScrape(listingId);
+    if (!data.description || !data.description.trim()) {
+      return {
+        ok: false,
+        error: "No description detected on listing page",
+        data,
+      };
+    }
+    return { ok: true, data };
+  } catch (e) {
+    mwLog("scrape_rpc_failed", "error", { listingId, error: e.message });
+    return { ok: false, error: e.message };
+  }
+}
 
 async function saveUserLocation(rawAddress) {
   const trimmed = (rawAddress || "").trim();
@@ -357,315 +380,230 @@ async function checkHelperHealth() {
   return result.claude_cli && result.claude_cli.status === "ok";
 }
 
-async function handleEvaluate(listingIds, sourceTabId, options = {}, profileByListingId = {}) {
-  const includeImages = !!options.includeImages;
-
-  // Replace any prior in-flight controller for this tab — re-clicking
-  // Evaluate before the previous batch finishes shouldn't accumulate
-  // controllers (the prior handleEvaluate's signal becomes orphaned but
-  // its tear-down logic still runs through the abort listener).
-  const prior = inFlightEvaluates.get(sourceTabId);
-  if (prior) prior.abort();
+// New per-batch ship handler. Content batcher already did the scrape
+// (passes scrapeData in items) and resolved the listing → profileId
+// mapping. We just need to: resolve profileId → {name, prompt}, attach
+// user_context, optionally fetch images, and ship via the existing
+// native-messaging path. Verdicts and batch_done flow back via
+// tabs.sendMessage.
+//
+// For re-evaluate (a manual single-listing flow that bypasses the batcher
+// via the right-click modal), items may arrive without scrapeData — we
+// fall through to enqueueScrape in that case.
+async function handleShipBatch(msg, sourceTabId) {
+  const requestId = msg.requestId;
+  const includeImages = !!msg.includeImages;
+  if (!requestId || !Array.isArray(msg.items) || msg.items.length === 0) {
+    sendBatchDone(sourceTabId, requestId, {
+      code: "invalid_payload",
+      message: "ship_batch requires requestId and non-empty items",
+    });
+    return;
+  }
+  if (inFlightBatches.has(requestId)) {
+    sendBatchDone(sourceTabId, requestId, {
+      code: "duplicate_request",
+      message: `requestId ${requestId} already in flight`,
+    });
+    return;
+  }
   const ac = new AbortController();
-  inFlightEvaluates.set(sourceTabId, ac);
+  inFlightBatches.set(requestId, { ac, tabId: sourceTabId });
 
   try {
-    return await runEvaluatePhases(listingIds, sourceTabId, options, ac.signal, profileByListingId);
+    await runShipBatch(msg.items, includeImages, sourceTabId, requestId, ac.signal);
+  } catch (e) {
+    if (!ac.signal.aborted) {
+      mwLog("ship_batch_error", "error", { requestId, error: e.message });
+      sendBatchDone(sourceTabId, requestId, {
+        code: "host_error",
+        message: e.message,
+      });
+    }
   } finally {
-    if (inFlightEvaluates.get(sourceTabId) === ac) {
-      inFlightEvaluates.delete(sourceTabId);
+    if (inFlightBatches.get(requestId)?.ac === ac) {
+      inFlightBatches.delete(requestId);
     }
   }
 }
 
-async function runEvaluatePhases(listingIds, sourceTabId, options, signal, profileByListingId = {}) {
-  const includeImages = !!options.includeImages;
-
-  // Fail-fast: a 40-second scrape phase is wasted effort if the helper
-  // isn't reachable. Confirm before we open any tabs.
-  const helperUp = await checkHelperHealth();
-  if (signal.aborted) return { cancelled: true };
-  if (!helperUp) {
-    const msg = "Helper unreachable — run `marketplace-watcher doctor` to diagnose, " +
-                "or `marketplace-watcher install` if the host has never been installed.";
-    console.warn("[mw] " + msg);
-    sendProgress(sourceTabId, { phase: "error", error: msg });
-    return { error: msg };
-  }
-
-  const cacheKeys = listingIds.map((id) => `verdict:${id}`);
-  const cached = await chrome.storage.local.get(cacheKeys);
-  const uncachedIds = listingIds.filter((id) => !cached[`verdict:${id}`]);
-
-  sendProgress(sourceTabId, {
-    phase: "fetching",
-    total: uncachedIds.length,
-    done: 0,
+async function runShipBatch(rawItems, includeImages, sourceTabId, requestId, signal) {
+  mwLog("ship_batch_start", "info", {
+    requestId,
+    listing_count: rawItems.length,
+    includeImages,
   });
 
-  console.log("[mw] evaluate request", { listingIds, cached: listingIds.length - uncachedIds.length, uncached: uncachedIds.length });
-  mwLog("evaluate_request", "info", {
-    listingIds,
-    cachedCount: listingIds.length - uncachedIds.length,
-    uncachedIds,
-  });
-
-  // Queue all scrapes through the shared enqueueScrape — this dedupes
-  // against any already-running eager prefetch and uses the storage cache
-  // for items that finished pre-scraping while the user was curating.
-  let done = 0;
-  sendProgress(sourceTabId, {
-    phase: "fetching",
-    total: uncachedIds.length,
-    done,
-  });
-
-  const scraped = await Promise.all(
-    uncachedIds.map(async (id) => {
-      // Don't waste a tab if cancel landed before our turn in the queue.
-      if (signal.aborted) {
-        return { id, error: "cancelled", cancelled: true };
-      }
+  // Step 1: ensure every item has scrapeData. Batcher path provides it;
+  // re-evaluate path doesn't. Either way enqueueScrape will dedup.
+  const items = [];
+  for (const raw of rawItems) {
+    if (signal.aborted) {
+      sendBatchDone(sourceTabId, requestId, { code: "cancelled", message: "user cancelled" });
+      return;
+    }
+    let scraped = raw.scrapeData;
+    if (!scraped) {
       try {
-        const data = await enqueueScrape(id);
-        done += 1;
-        sendProgress(sourceTabId, {
-          phase: "fetching",
-          total: uncachedIds.length,
-          done,
-        });
-        console.log(`[mw] ready ${id}:`, {
-          title: data.title,
-          price: data.price,
-          location: data.location,
-          descChars: (data.description || "").length,
-          descSnippet: (data.description || "").slice(0, 120),
-          distance_miles: data.distance_miles,
-        });
-        mwLog("scrape_ready", "info", {
-          listingId: id,
-          title: data.title,
-          price: data.price,
-          location: data.location,
-          descChars: (data.description || "").length,
-          descSnippet: (data.description || "").slice(0, 200),
-          distance_miles: data.distance_miles,
-        });
-        const result = { id, ...data };
-        // Empty description = structural scrape failed. Don't ship the
-        // listing to Claude with no body — that produces a verdict based
-        // only on title/price and silently hides the scrape failure from
-        // the user. Mark it as an error so the search page renders an
-        // ERR badge they can act on (re-analyze later, or open the
-        // listing to verify FB's markup).
-        if (!data.description || !data.description.trim()) {
-          result.error = "No description detected on listing page";
-          mwLog("scrape_no_description", "warn", { listingId: id, title: data.title, price: data.price });
-        }
-        return result;
+        scraped = await enqueueScrape(raw.id);
       } catch (e) {
-        done += 1;
-        sendProgress(sourceTabId, {
-          phase: "fetching",
-          total: uncachedIds.length,
-          done,
-        });
-        console.warn(`[mw] scrape failed ${id}:`, e.message);
-        mwLog("scrape_failed", "error", { listingId: id, error: e.message });
-        return { id, error: e.message };
+        mwLog("scrape_failed", "error", { listingId: raw.id, error: e.message });
+        items.push({ id: raw.id, _error: e.message, _profileId: raw.profileId });
+        continue;
       }
-    })
-  );
-
-  if (signal.aborted) {
-    sendProgress(sourceTabId, { phase: "cancelled" });
-    return { cancelled: true };
+    }
+    if (!scraped.description || !scraped.description.trim()) {
+      items.push({
+        id: raw.id,
+        _error: "No description detected on listing page",
+        _profileId: raw.profileId,
+        title: scraped.title,
+        price: scraped.price,
+        location: scraped.location,
+      });
+      continue;
+    }
+    items.push({ id: raw.id, _profileId: raw.profileId, ...scraped });
   }
 
-  const valid = scraped.filter((s) => !s.error);
+  // Step 2: resolve profileIds via chrome.storage (snapshot at ship-time so
+  // a rename in Settings between commit and ship is reflected).
+  const profileIds = new Set(
+    items.map((i) => i._profileId).filter((p) => p && p !== "default")
+  );
+  let profilesById = {};
+  if (profileIds.size > 0) {
+    const profStore = (await chrome.storage.local.get("profiles")).profiles;
+    if (Array.isArray(profStore)) {
+      for (const p of profStore) profilesById[p.id] = p;
+    }
+  }
 
-  // Attach any user-provided context notes. These are first-party
-  // observations (typically from photos) the user wants the model to weigh
-  // alongside the scraped description. Persisted under `context:{id}` and
-  // not cleared on re-analysis, so they carry forward across runs.
+  // Step 3: attach user_context + profile (only for the valid ones).
+  const valid = items.filter((i) => !i._error);
   if (valid.length) {
     const ctxKeys = valid.map((v) => `context:${v.id}`);
     const ctxStore = await chrome.storage.local.get(ctxKeys);
     for (const v of valid) {
       const note = ctxStore[`context:${v.id}`];
       if (note) v.user_context = note;
+      const pid = v._profileId;
+      if (pid && pid !== "default") {
+        const profile = profilesById[pid];
+        if (profile && profile.name && profile.prompt) {
+          v.profile = { name: profile.name, prompt: profile.prompt };
+        }
+      }
     }
   }
 
-  // Image fetch phase. Only runs on the explicit re-analyze opt-in path. Any
-  // failure aborts the whole evaluate — per the agreed decision, we don't
-  // want to silently degrade to text-only when the user explicitly asked for
-  // a photo-aware analysis.
+  // Step 4: optional image fetch.
   if (includeImages && valid.length) {
-    sendProgress(sourceTabId, { phase: "images" });
     try {
       for (const v of valid) {
+        if (signal.aborted) break;
         const urls = (v.images || []).map((i) => i.url);
         if (urls.length === 0) {
-          throw new Error(
-            "No photos detected on this listing. Re-analyze without 'Include photos' to proceed."
-          );
+          throw new Error("No photos detected on this listing.");
         }
         v.images_b64 = await fetchImagesAsBase64(v.id, urls);
       }
     } catch (e) {
-      console.error("[mw] image fetch failed:", e.message);
-      mwLog("image_fetch_aborted", "error", { error: e.message });
-      sendProgress(sourceTabId, { phase: "error", error: e.message });
-      return { error: e.message };
+      mwLog("image_fetch_aborted", "error", { requestId, error: e.message });
+      sendBatchDone(sourceTabId, requestId, {
+        code: "image_fetch_failed",
+        message: e.message,
+      });
+      return;
     }
   }
 
-  let verdicts = [];
+  // Persist scrape-side errors as verdict:${id} so the badge survives reload.
   const updates = {};
-  // Resolve profileByListingId (ids only — keeps the wire format from
-  // having to ship the prompt text from the content script) into the
-  // {name, prompt} objects the host expects per listing. Look up via
-  // chrome.storage rather than trust the content script's snapshot —
-  // user might have edited a profile in Settings between Skip→pick and
-  // Evaluate, and we want the latest text.
-  let profilesById = {};
-  if (Object.keys(profileByListingId).length > 0) {
-    const profStore = (await chrome.storage.local.get("profiles")).profiles;
-    if (Array.isArray(profStore)) {
-      for (const p of profStore) profilesById[p.id] = p;
-    }
-  }
-  for (const item of valid) {
-    const profileId = profileByListingId[item.id];
-    if (!profileId || profileId === "default") continue;
-    const profile = profilesById[profileId];
-    if (profile && profile.name && profile.prompt) {
-      // Wire shape — see DISTRIBUTION.md "Native-messaging protocol
-      // changes". Host clamps name (200) / prompt (2000) and flattens
-      // into profile_name / profile_prompt for build_user_prompt.
-      item.profile = { name: profile.name, prompt: profile.prompt };
-    }
-  }
-  if (valid.length) {
-    sendProgress(sourceTabId, { phase: "evaluating" });
-    console.log("[mw] sending to helper:", valid.map(v => ({
-      id: v.id,
-      title: v.title,
-      price: v.price,
-      hasContext: !!v.user_context,
-      imageCount: v.images_b64 ? v.images_b64.length : 0,
-    })));
-    const costParams = await getCostParams();
-    try {
-      // Verdicts stream in as chunks complete. Persist each one to
-      // chrome.storage.local immediately so a mid-batch disconnect leaves
-      // the completed verdicts cached — the next attempt will see them in
-      // the verdict:<id> cache and skip them. Also push to the source tab
-      // so cards repaint one-by-one instead of all-at-once at batch end.
-      let streamedCount = 0;
-      verdicts = await runEvaluateBatchStreaming(valid, costParams, signal, async (v) => {
-        const item = valid.find((s) => s.id === v.id);
-        const imgCount = item?.images_b64 ? item.images_b64.length : 0;
-        const profileName = item?.profile?.name;
-        const entry = {
-          ...v,
-          title: item?.title,
-          price: item?.price,
-          location: item?.location,
-          description: item?.description,
-          user_context: item?.user_context,
-          distance_miles: item?.distance_miles,
-          drive_time_one_way_min: item?.drive_time_one_way_min,
-          round_trip_gas_cost: item?.round_trip_gas_cost,
-          round_trip_time_cost: item?.round_trip_time_cost,
-          images_included: imgCount > 0,
-          image_count: imgCount,
-          evaluatedAt: Date.now(),
-          // Snapshot the profile NAME (not id) so a later profile rename
-          // or delete doesn't orphan the cached verdict. Omit the field
-          // entirely when no profile was applied — see DISTRIBUTION.md.
-          ...(profileName ? { profile_name: profileName } : {}),
-        };
-        updates[`verdict:${v.id}`] = entry;
-        await chrome.storage.local.set({ [`verdict:${v.id}`]: entry });
-        streamedCount += 1;
-        if (sourceTabId != null) {
-          try {
-            await chrome.tabs.sendMessage(sourceTabId, {
-              type: "verdict_streamed",
-              verdict: entry,
-              done: streamedCount,
-              total: valid.length,
-            });
-          } catch (_) {
-            // Tab closed mid-batch; drop the message. The verdict is
-            // still in storage, so a reload will pick it up.
-          }
-        }
-      });
-      console.log("[mw] verdicts:", verdicts);
-      await chrome.storage.local.set({
-        last_evaluation: {
-          ts_iso: new Date().toISOString(),
-          ok: true,
-          error: null,
-        },
-      });
-    } catch (e) {
-      // If the signal aborted, the port disconnect surfaces as a host_disconnect
-      // error here — that's expected and should be reported as a cancel, not a
-      // failure. Already-streamed verdicts remain in storage.
-      if (signal.aborted) {
-        console.log("[mw] evaluate cancelled by user");
-        sendProgress(sourceTabId, { phase: "cancelled" });
-        return { cancelled: true };
-      }
-      console.error("[mw] helper error:", e.message);
-      sendProgress(sourceTabId, { phase: "error", error: e.message });
-      const errPayload = e.batchError
-        ? { code: e.batchError.code, message: e.batchError.message }
-        : { code: "host_error", message: e.message };
-      await chrome.storage.local.set({
-        last_evaluation: {
-          ts_iso: new Date().toISOString(),
-          ok: false,
-          error: errPayload,
-        },
-      });
-      // Don't abort — some verdicts may have streamed in already; preserve
-      // them. Fall through to return them with an error marker for the rest.
-    }
-  }
-  // Persist scrape-side failures (no description, scrape timeout, etc.) too,
-  // so the ERR badge survives page reloads instead of going back to an
-  // empty checkbox. Re-analyzing a listing busts the cache, so this is
-  // sticky-but-recoverable.
-  for (const s of scraped) {
-    if (!s.error) continue;
-    updates[`verdict:${s.id}`] = {
-      id: s.id,
-      error: s.error,
-      title: s.title,
-      price: s.price,
-      location: s.location,
-      description: s.description,
+  for (const i of items) {
+    if (!i._error) continue;
+    const entry = {
+      id: i.id,
+      error: i._error,
+      title: i.title,
+      price: i.price,
+      location: i.location,
       evaluatedAt: Date.now(),
     };
-  }
-  if (Object.keys(updates).length) {
-    await chrome.storage.local.set(updates);
+    updates[`verdict:${i.id}`] = entry;
+    await chrome.storage.local.set({ [`verdict:${i.id}`]: entry });
+    sendVerdictStreamed(sourceTabId, requestId, entry);
   }
 
-  const allVerdicts = listingIds.map((id) => {
-    if (cached[`verdict:${id}`]) return cached[`verdict:${id}`];
-    if (updates[`verdict:${id}`]) return updates[`verdict:${id}`];
-    const failed = scraped.find((s) => s.id === id && s.error);
-    return { id, error: failed ? failed.error : "evaluation failed" };
-  });
+  if (valid.length === 0) {
+    if (Object.keys(updates).length) await chrome.storage.local.set(updates);
+    sendBatchDone(sourceTabId, requestId, null);
+    return;
+  }
 
-  sendProgress(sourceTabId, { phase: "done" });
-  return { verdicts: allVerdicts };
+  // Strip internal fields before shipping (host doesn't know about them).
+  const wireListings = valid.map(({ _profileId, _error, ...rest }) => rest);
+  const costParams = await getCostParams();
+
+  try {
+    await runEvaluateBatchStreaming(wireListings, costParams, signal, async (v) => {
+      const item = valid.find((s) => s.id === v.id);
+      const imgCount = item?.images_b64 ? item.images_b64.length : 0;
+      const profileName = item?.profile?.name;
+      const entry = {
+        ...v,
+        title: item?.title,
+        price: item?.price,
+        location: item?.location,
+        description: item?.description,
+        user_context: item?.user_context,
+        distance_miles: item?.distance_miles,
+        drive_time_one_way_min: item?.drive_time_one_way_min,
+        round_trip_gas_cost: item?.round_trip_gas_cost,
+        round_trip_time_cost: item?.round_trip_time_cost,
+        images_included: imgCount > 0,
+        image_count: imgCount,
+        evaluatedAt: Date.now(),
+        ...(profileName ? { profile_name: profileName } : {}),
+      };
+      await chrome.storage.local.set({ [`verdict:${v.id}`]: entry });
+      sendVerdictStreamed(sourceTabId, requestId, entry);
+    });
+    await chrome.storage.local.set({
+      last_evaluation: { ts_iso: new Date().toISOString(), ok: true, error: null },
+    });
+    sendBatchDone(sourceTabId, requestId, null);
+  } catch (e) {
+    if (signal.aborted) {
+      sendBatchDone(sourceTabId, requestId, { code: "cancelled", message: "user cancelled" });
+      return;
+    }
+    const errPayload = e.batchError
+      ? { code: e.batchError.code, message: e.batchError.message }
+      : { code: "host_error", message: e.message };
+    await chrome.storage.local.set({
+      last_evaluation: {
+        ts_iso: new Date().toISOString(),
+        ok: false,
+        error: errPayload,
+      },
+    });
+    sendBatchDone(sourceTabId, requestId, errPayload);
+  }
+}
+
+function sendVerdictStreamed(tabId, requestId, verdict) {
+  if (tabId == null) return;
+  chrome.tabs
+    .sendMessage(tabId, { type: "verdict_streamed", verdict, requestId })
+    .catch(() => {});
+}
+
+function sendBatchDone(tabId, requestId, error) {
+  if (tabId == null) return;
+  chrome.tabs
+    .sendMessage(tabId, { type: "batch_done", requestId, error })
+    .catch(() => {});
 }
 
 async function scrapeListing(listingId) {
@@ -719,10 +657,6 @@ async function scrapeListing(listingId) {
     // timer regardless so we don't hang forever.
     const loadFailsafeTimer = setTimeout(armScrapeTimer, TAB_LOAD_FAILSAFE_MS);
   });
-}
-
-function sendProgress(tabId, payload) {
-  chrome.tabs.sendMessage(tabId, { type: "progress", ...payload }).catch(() => {});
 }
 
 function sleep(ms) {
