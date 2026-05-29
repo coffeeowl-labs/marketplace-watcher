@@ -66,12 +66,22 @@ def _posix_candidates() -> list[tuple[str, list[str], Path]]:
     ]
 
 
+def _macos_native_host_dir() -> Path:
+    return (_home() / "Library" / "Application Support" / "Mozilla" /
+            "NativeMessagingHosts")
+
+
 def _macos_candidates() -> list[tuple[str, list[str], Path]]:
-    home = _home()
+    # All Gecko browsers on macOS read the same Mozilla NativeMessagingHosts
+    # dir (verified for Firefox + Zen; LibreWolf/Waterfox/Floorp are Firefox
+    # forks that honor it too). We list the fork executables for PATH-based
+    # detection, but note that macOS .app bundles installed from a DMG rarely
+    # put their binary on PATH — so detect_manifest_dirs() also force-writes
+    # this dir on macOS regardless of detection (see the fallback there).
     return [
-        ("macos-gecko-shared", ["firefox", "zen-browser", "zen"],
-            home / "Library" / "Application Support" / "Mozilla" /
-            "NativeMessagingHosts"),
+        ("macos-gecko-shared", ["firefox", "zen-browser", "zen",
+                                 "librewolf", "waterfox", "floorp"],
+            _macos_native_host_dir()),
     ]
 
 
@@ -119,9 +129,18 @@ def detect_manifest_dirs() -> list[tuple[str, Path]]:
         if any(shutil.which(e) for e in exes) or path.exists():
             dirs.append((label, path))
 
-    if not dirs and sys.platform != "win32":
-        fallback = _home() / ".mozilla" / "native-messaging-hosts"
-        dirs.append(("fallback-stock-firefox", fallback))
+    if not dirs:
+        # Nothing detected. Fall back to the platform's stock Gecko native-host
+        # dir so the manifest at least lands somewhere the browser reads.
+        # CRITICAL: this must be platform-aware — macOS .app bundles from a DMG
+        # don't put `firefox` on PATH and the NativeMessagingHosts dir may not
+        # exist yet, so the macOS common case lands here. Writing the Linux
+        # ~/.mozilla path on macOS would silently fail (Firefox never reads it).
+        if sys.platform == "darwin":
+            dirs.append(("fallback-macos-gecko", _macos_native_host_dir()))
+        else:
+            fallback = _home() / ".mozilla" / "native-messaging-hosts"
+            dirs.append(("fallback-stock-firefox", fallback))
 
     return dirs
 

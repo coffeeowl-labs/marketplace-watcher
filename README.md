@@ -51,15 +51,28 @@ found", you skipped step 3 or are still in the original terminal window
 
 ### What `install` does
 
-It detects every Gecko-based browser on the system (stock Firefox, Zen,
-LibreWolf, Waterfox, Floorp; plus Snap and Flatpak Firefox; plus Flatpak
-Zen on Linux) and writes the native-messaging-host manifest to each
-applicable location — a JSON file under `~/.mozilla/native-messaging-hosts/`
-on Linux/macOS, an `HKCU\Software\Mozilla\NativeMessagingHosts\` registry
-key on Windows. It also verifies that the Claude CLI is on `PATH` and
-records its absolute path so the host process can find it later, even
-when launched by a GUI-shortcut Firefox that doesn't inherit your shell's
-`PATH`.
+It writes the native-messaging-host manifest to every applicable location
+for your platform, verifies the Claude CLI is on `PATH`, and records its
+absolute path so the host process can find it later (even when launched by
+a GUI-shortcut browser that doesn't inherit your shell's `PATH`).
+
+Per-platform coverage:
+
+- **Linux** — detects stock Firefox, Zen, LibreWolf, Waterfox, Floorp
+  (shared `~/.mozilla/native-messaging-hosts/`), plus Snap Firefox, Flatpak
+  Firefox, and Flatpak Zen at their sandboxed paths. Installs to every one
+  detected; falls back to the stock Firefox path if none are detected.
+- **macOS** — all Gecko browsers (Firefox, Zen, and the LibreWolf/Waterfox/
+  Floorp forks) share `~/Library/Application Support/Mozilla/
+  NativeMessagingHosts/`. Because macOS `.app` bundles from a DMG usually
+  aren't on `PATH`, detection often finds nothing — so `install` writes to
+  that shared dir unconditionally, which all of them read.
+- **Windows** — writes one `HKCU\Software\Mozilla\NativeMessagingHosts\`
+  registry key (pointing at a JSON manifest in your config dir). This is
+  browser-agnostic for anything that reads the standard Mozilla key.
+  **Caveat:** Firefox is verified; whether Zen / LibreWolf on Windows read
+  the Mozilla key or their own registry hive is **untested** — if a Windows
+  fork reports "no such native application," that's the likely cause.
 
 ### Install the signed extension
 
@@ -84,6 +97,12 @@ Marketplace Watcher → Preferences).
 | Gas price ($/gal) | 5 | Round-trip fuel cost = `(2 × distance / mpg) × gas_price`. |
 | Vehicle efficiency (MPG) | 25 |  |
 
+The options page also has an **Evaluation profiles** section: add, rename,
+edit, and delete named criteria blocks. Each profile is a name plus a
+free-text prompt describing your fit requirements. Profiles you define here
+populate the per-card picker on the search page. Edits sync to open
+Marketplace tabs without a reload.
+
 The three pills at the top of the page show live status:
 
 - `helper: connected` — native-messaging port to the helper is open.
@@ -96,18 +115,58 @@ just without the trip-cost adjustment.
 
 ## Use
 
-Open `facebook.com/marketplace` and run a search. Checkboxes appear on
-each listing card. Tick a few and click the **Evaluate (N)** floating
-button. Verdicts stream in as each chunk completes, and the cards get
-colored badges:
+Open `facebook.com/marketplace` and run a search. Each listing card gets a
+small **dropdown picker** in its top-left corner. There's no "Evaluate"
+button — selecting a listing *is* the trigger.
 
-- 🟢 **steal** — 30%+ below market, or otherwise exceptional
+Picker options:
+
+- **None** — not selected (default).
+- **Evaluate (default)** — evaluate with no extra criteria.
+- *(your profiles)* — evaluate against a saved criteria profile (see below).
+- **Junk (hide)** — permanently hide this listing. Useful for the junk
+  Marketplace recycles into your results once it runs out of real matches.
+
+When you pick anything other than None/Junk, the listing enters a short
+**~2-second grace window** (badge shows `QUEUING…`) during which you can
+change your mind — pick None to cancel before any work happens. After that
+it scrapes the listing page, then waits in a queue.
+
+### Batching: 3-listing minimum
+
+Listings ship to Claude in **batches of 3–5**. This is deliberate: the tool
+earns its keep when you're *comparing* several candidates, not judging one
+in isolation — for a single listing you'd just eyeball it yourself. So a
+selected listing shows `WAITING (N more)` until at least **3** are queued.
+If you only ever select 1–2, they sit waiting and never evaluate. Once 3+
+are queued and you pause for ~2 seconds, the batch ships; verdicts stream
+back per-card as Claude finishes each one.
+
+A floating **Stop All** pill appears while anything is in flight — click it
+to cancel queued and in-progress evaluations for the current tab.
+
+Cards get colored badges:
+
+- 🟡 **steal** — 30%+ below market, or otherwise exceptional
 - 🟢 **good** — 10–30% below market and the trip cost still pencils
-- 🔵 **fair** — priced about right, or a decent deal eroded by distance
+- ⬛ **fair** — priced about right, or a decent deal eroded by distance
 - 🔴 **skip** — overpriced, suspicious, or made unattractive by trip cost
 
-Re-analyzing a listing (right-click on a card after evaluation) optionally
-includes photos in the prompt — useful for assessing condition.
+### Evaluation profiles
+
+Profiles let you attach reusable, first-party criteria to an evaluation —
+e.g. a "Small mountain bikes" profile whose prompt is "must be a small
+adult frame, full suspension preferred." A listing that clearly violates a
+stated criterion can't be rated steal/good. Create and edit profiles in the
+options page (see **Configure**); they then appear in every card's picker.
+
+### Re-analyze with photos / notes
+
+Right-click a card's verdict badge to open a context box. You can add notes
+(prepended to the description on re-analysis — handy for cues from photos
+like "rust on frame") and optionally **Save & Re-analyze** with photos
+included in the prompt. Re-analyze runs that single listing immediately,
+bypassing the 3-listing minimum.
 
 ## Troubleshoot
 
@@ -135,9 +194,14 @@ the extension's options page (Advanced disclosure).
 
 - **`extension/`** — Firefox MV3 extension. Three background scripts
   (`protocol.js`, `native_messaging.js`, `background.js`) plus content
-  scripts on `facebook.com/marketplace/*search*` and
-  `facebook.com/marketplace/item/*`. State (cached verdicts, geocoded
-  user location, OSRM route cache) lives in `chrome.storage.local`.
+  scripts: `content/batcher.js` + `content/search.js` on
+  `facebook.com/marketplace/*search*` (the picker, the auto-commit batcher
+  state machine, and verdict badges) and `content/listing.js` on
+  `facebook.com/marketplace/item/*` (the per-listing scraper). Background is
+  stateless transport — it owns the host port and the scrape queue but the
+  batcher state lives per-tab in the content script. State that must persist
+  (cached verdicts, geocoded user location, OSRM route cache, profiles,
+  junked-listing ids) lives in `chrome.storage.local`.
 - **`marketplace_watcher/`** — Python package installed as a uv tool.
   Two entry points:
   - `marketplace-watcher` — CLI: `install`, `uninstall`, `repair`,

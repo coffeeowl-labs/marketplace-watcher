@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import pytest
 
+from marketplace_watcher import install
 from marketplace_watcher.config import Config
 from marketplace_watcher.install import (
     _build_manifest,
@@ -105,10 +106,34 @@ def test_detect_manifest_dirs_fallback_when_no_browser_present(tmp_path, monkeyp
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     monkeypatch.setattr("shutil.which", lambda _name: None)
     dirs = detect_manifest_dirs()
-    # Always falls back to writing stock-firefox path so the user has a
-    # known location to investigate.
+    # Always falls back so the user has a known location to investigate.
+    # The label is platform-specific (macOS uses a different native-host dir).
     labels = {label for label, _ in dirs}
-    assert "fallback-stock-firefox" in labels
+    if sys.platform == "darwin":
+        assert "fallback-macos-gecko" in labels
+    else:
+        assert "fallback-stock-firefox" in labels
+
+
+def test_macos_fallback_targets_library_not_dotmozilla(tmp_path, monkeypatch):
+    # Regression: a fresh macOS Firefox (installed from a DMG) usually isn't on
+    # PATH and its NativeMessagingHosts dir doesn't exist yet, so detection
+    # finds nothing and we hit the fallback. The fallback MUST write to
+    # ~/Library/Application Support/Mozilla/NativeMessagingHosts — writing the
+    # Linux ~/.mozilla path (the old bug) lands the manifest where Firefox on
+    # macOS never reads it, producing a silent "no such native application".
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    monkeypatch.setattr(install.sys, "platform", "darwin")
+    dirs = detect_manifest_dirs()
+    assert len(dirs) == 1
+    label, path = dirs[0]
+    assert label == "fallback-macos-gecko"
+    assert path == (
+        tmp_path / "Library" / "Application Support" / "Mozilla" /
+        "NativeMessagingHosts"
+    )
+    assert ".mozilla" not in str(path)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX detection only")
