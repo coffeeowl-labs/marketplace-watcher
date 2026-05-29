@@ -77,7 +77,7 @@ Per-platform coverage:
 ### Install the signed extension
 
 Open this URL in Firefox / Zen:
-<https://github.com/coffeeowl-labs/marketplace-watcher/releases/download/v0.1.0/marketplace-watcher-0.1.0.xpi>
+<https://github.com/coffeeowl-labs/marketplace-watcher/releases/download/v0.2.0/marketplace-watcher-0.2.0.xpi>
 
 Firefox will prompt for permission to install. The extension is signed by
 Mozilla via AMO (unlisted), so it persists across browser restarts.

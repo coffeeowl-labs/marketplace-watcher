@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "marketplace-watcher"
-version = "0.1.0"
+version = "0.2.0"
 description = "Native-messaging host for the Marketplace Watcher Firefox extension. Evaluates Facebook Marketplace listings via the Claude CLI."
 readme = "README.md"
 license = "MIT"
